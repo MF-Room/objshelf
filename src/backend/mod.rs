@@ -2,7 +2,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::ObjectId;
 
-pub trait Backend: Sized {
+pub(crate) trait Backend: Sized {
     type Error;
     type Config;
 
