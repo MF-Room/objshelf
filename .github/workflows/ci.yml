@@ -22,3 +22,5 @@ jobs:
         name: clippy (host)
       - run: cargo clippy --target thumbv7em-none-eabihf -- -D warnings
         name: clippy (no_std)
+      - run: cargo test
+        name: test (host)
