@@ -36,7 +36,7 @@
 //! | `read` | `k` page reads | `O(len)` |
 //! | `write`, no GC | `k` blank-check reads, `k` page writes, `k'` 1-byte writes | `O(len + S)` |
 //! | `remove` | `k'` 1-byte writes | `O(k')` |
-//! | GC, per sector reclaimed | up to `P` reads, `P - 1` page writes, 1 erase, 2 small writes | `O(S + P)` |
+//! | GC, per sector reclaimed | up to `2 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 2 small writes | `O(S + P)` |
 //!
 //! Hash map operations are expected `O(1)`. Garbage collection only runs inside a `write` that
 //! lacks space, possibly for several sectors. Opening a sector never used before also erases it.
