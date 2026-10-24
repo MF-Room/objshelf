@@ -5,6 +5,59 @@
 //! pages are on flash, so after a power cut an object holds either its old or its new value.
 //! Replaced and removed pages are marked obsolete. Garbage collection relocates the live pages of
 //! the sector with the most garbage, then erases it.
+//!
+//! # Requirements
+//!
+//! - **Heap**: `alloc` and a global allocator (index, page lists, serialized objects).
+//! - **Flash**: `embedded_storage_async::nor_flash::NorFlash` with `WRITE_SIZE == 1` and
+//!   `READ_SIZE == 1`, `ERASE_SIZE` a multiple of 256 and at least 512. `MultiwriteNorFlash` is not
+//!   needed: every byte is programmed at most once between erases, and only from `0xFF`. Chips with
+//!   internal ECC (`WRITE_SIZE > 1`) are not supported.
+//! - **Region**: aligned to `ERASE_SIZE`, at least 2 sectors (one is kept free for garbage
+//!   collection), at most 65536 pages (16 MiB), used by nothing else.
+//! - **Async**: an executor. Storage futures must not be cancelled: a dropped write leaves the RAM
+//!   index out of sync with the flash until the next mount.
+//! - **Values**: `Serialize` / `DeserializeOwned` (postcard).
+//!
+//! # Guarantees
+//!
+//! - A `write` or `remove` is on flash when it returns; `flush` does nothing.
+//! - Each object is updated atomically. There are no transactions over several objects.
+//! - After a power cut at any point, mount restores a consistent state.
+//!
+//! # Time
+//!
+//! `N` pages in the region, `S` sectors, `P` pages per sector (16 with 4 KiB sectors), `k` pages
+//! of the object (`ceil(len / 235)`, at least 1), `k'` pages of its previous version.
+//!
+//! | Operation | Flash | CPU |
+//! |---|---|---|
+//! | `mount` | reads all `N` pages; after a crash, one 1-byte write per stale page | `O(N + S)` |
+//! | `read` | `k` page reads | `O(len)` |
+//! | `write`, no GC | `k` blank-check reads, `k` page writes, `k'` 1-byte writes | `O(len + S)` |
+//! | `remove` | `k'` 1-byte writes | `O(k')` |
+//! | GC, per sector reclaimed | up to `P` reads, `P - 1` page writes, 1 erase, 2 small writes | `O(S + P)` |
+//!
+//! Hash map operations are expected `O(1)`. Garbage collection only runs inside a `write` that
+//! lacks space, possibly for several sectors. Opening a sector never used before also erases it.
+//!
+//! On the W25Q16JV at 25 MHz: page read ≈ 0.1 ms, page write 0.4 ms (3 ms max), sector erase
+//! 45 ms (400 ms max), mount of 2 MiB ≈ 0.7 s of SPI reads.
+//!
+//! # Space
+//!
+//! RAM, 32-bit target:
+//!
+//! - index: about 24 B per object plus 2 B per page. Each page belongs to at most one object, so
+//!   page lists total at most `2 × N` bytes (16 KiB for 2 MiB);
+//! - sector table: 16 B per sector (8 KiB for 2 MiB with 4 KiB sectors);
+//! - `read` and `write`: the whole serialized object, plus a 256 B page buffer on the stack;
+//! - `mount`, temporarily: 4 B per page found, 8 B per sector.
+//!
+//! Flash: 235 payload bytes per 256-byte page, page 0 of each sector for its header, one sector
+//! kept free, at least one page per object. On a whole W25Q16JV (512 sectors) that is at most
+//! 511 × 15 × 235 B ≈ 1.72 MiB of live data. An update also needs room for its new version before
+//! the old one is released.
 
 mod layout;
 #[cfg(test)]

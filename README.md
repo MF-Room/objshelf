@@ -18,6 +18,9 @@ writes (chips with internal ECC are not supported for now).
   sector is kept for it. Ties go to the least worn sector.
 * Mount reads the whole region and rebuilds the index (2 MiB at 25 MHz: about 0.7 s).
 
+Requirements, guarantees, time and space complexity: module documentation in
+[`src/backend/nor/mod.rs`](src/backend/nor/mod.rs) (`cargo doc --document-private-items`).
+
 ## TODO
 
 - [ ] Decide on the SPI NOR driver: use an existing one or write a generic one.
