@@ -21,7 +21,7 @@
 //!
 //! # Guarantees
 //!
-//! - A `write` or `remove` is on flash when it returns; `flush` does nothing.
+//! - A `write` or `remove` is on flash when it returns: nothing is buffered.
 //! - Each object is updated atomically. There are no transactions over several objects.
 //! - After a power cut at any point, mount restores a consistent state.
 //!
@@ -527,10 +527,5 @@ impl<F: NorFlash> Backend for NorBackend<F> {
     async fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error> {
         let object = self.objects.remove(&id).ok_or(NorError::NotFound)?;
         self.release(&object.pages).await
-    }
-
-    /// Nothing is buffered: a write is on flash when it returns.
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(())
     }
 }
