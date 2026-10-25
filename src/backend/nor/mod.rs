@@ -84,14 +84,16 @@ use layout::{
 const RESERVED_SECTORS: usize = 1;
 
 /// Configuration of a [`NorBackend`].
-pub(crate) struct NorConfig<F> {
-    pub(crate) flash: F,
+pub struct NorConfig<F> {
+    /// Flash driver.
+    pub flash: F,
     /// Flash region used by the backend: aligned to `F::ERASE_SIZE`, at least 2 sectors.
-    pub(crate) range: Range<u32>,
+    pub range: Range<u32>,
 }
 
+/// Errors of a [`NorBackend`].
 #[derive(Debug)]
-pub(crate) enum NorError<E> {
+pub enum NorError<E> {
     /// The flash driver failed.
     Flash(E),
     /// Unsupported region or flash geometry (`WRITE_SIZE` and `READ_SIZE` must be 1).
@@ -130,7 +132,7 @@ struct Candidate {
 }
 
 /// Object store on any NOR flash with 1-byte writes.
-pub(crate) struct NorBackend<F: NorFlash> {
+pub struct NorBackend<F: NorFlash> {
     flash: F,
     start: u32,
     sectors: Vec<Sector>,

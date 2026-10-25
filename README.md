@@ -52,7 +52,15 @@ Requirements, guarantees, time and space complexity: module documentation in
   - power cut during mount, which can write (stale pages marked obsolete): not tested yet
 - [ ] Roles of the NOR and FRAM tiers, residency (loading, eviction, write-back)
 - [ ] Protection policy at mount: clear or fail
-- [ ] Max object size, flash region used by tiermem, `ObjectId` allocation
+- [ ] Implement `TierMem` (`src/memory.rs`, Marius): the public API is written, the bodies are `todo!`.
+  Open points (`TODO(Marius)` in the code):
+  - lock: a busy flag (`AtomicBool`) rather than a critical section, which would disable interrupts
+    during storage I/O
+  - name → `ObjectId` mapping: a persisted directory object (e.g. id 0) or a hash of the name; max name
+    length
+  - residency: when to load and evict objects, write-back of modified objects, RAM budget
+  - type check on `get` (stored type tag or schema hash) instead of a postcard error
+- [ ] Max object size, flash region used by tiermem
 - [ ] Schema versioning and migration of stored types
 - [x] Host tests with a simulated `NorFlash` (power cuts, two geometries), `cargo test` in CI
 - [ ] Hardware tests on the MSeq PCB through [mseq_pcb_tb](https://github.com/MF-Room/mseq_pcb_tb)

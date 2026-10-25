@@ -1,6 +1,6 @@
 //! Storage backends: where objects live when they are not in RAM.
 
-mod nor;
+pub mod nor;
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -9,8 +9,11 @@ use crate::ObjectId;
 /// Persistent store of serialized objects, addressed by `ObjectId`.
 ///
 /// One operation runs at a time (`&mut self`). Storage futures must not be cancelled: a dropped
-/// operation can leave the backend's RAM state out of sync with the storage.
-pub(crate) trait Backend: Sized {
+/// operation can leave the backend's RAM state out of sync with the storage. `TierMem` runs each
+/// of them to completion with `block_on`, so this only concerns code that awaits a backend directly.
+// The futures don't need to be `Send`: `TierMem` polls them in place.
+#[allow(async_fn_in_trait)]
+pub trait Backend: Sized {
     /// Errors of the backend and of its storage driver.
     type Error;
     /// What `mount` needs: the storage driver and its settings.
