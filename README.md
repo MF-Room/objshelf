@@ -50,7 +50,6 @@ Requirements, guarantees, time and space complexity: module documentation in
     `u32` version counter (wraps after 4 billion writes)
   - first use of a fresh chip erases each sector when it is first opened (one erase per sector)
   - power cut during mount, which can write (stale pages marked obsolete): not tested yet
-- [ ] Roles of the NOR and FRAM tiers, residency (loading, eviction, write-back)
 - [ ] Protection policy at mount: clear or fail
 - [ ] Implement `TierMem` (`src/memory.rs`, Marius): the public API is written, the bodies are `todo!`.
   Open points (`TODO(Marius)` in the code):

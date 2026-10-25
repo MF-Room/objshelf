@@ -42,8 +42,8 @@ impl<T> Copy for Handle<T> {}
 /// Errors of [`TierMem`], generic over the backend's error `E`.
 #[derive(Debug)]
 pub enum Error<E> {
-    /// The storage is in use, or the object is not in RAM and loading it would need I/O. Only
-    /// returned by the `try_*` methods; the others wait instead.
+    /// The storage is busy with another operation (for example a write or an erase). Only returned
+    /// by the `try_*` methods; the others wait instead.
     Busy,
     /// No object with this name.
     NotFound,

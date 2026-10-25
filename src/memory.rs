@@ -20,7 +20,7 @@ use crate::{Error, Handle, Storable};
 /// let settings: Handle<Settings> = mem.get("settings")?;
 /// let bpm = mem.with(&settings, |s| s.bpm)?; // waits if the storage is busy
 /// mem.with_mut(&settings, |s| s.bpm = 120)?;
-/// match mem.try_with(&settings, |s| s.bpm) { // never waits
+/// match mem.try_with(&settings, |s| s.bpm) { // returns Busy instead of waiting
 ///     Err(Error::Busy) => { /* try again later */ }
 ///     result => { /* ... */ }
 /// }
@@ -33,8 +33,9 @@ use crate::{Error, Handle, Storable};
 /// operation can never be dropped halfway and leave the backend out of sync with its storage. The
 /// price is that blocking calls hold the CPU during storage I/O: loading an object takes a few ms,
 /// and a write that needs garbage collection on NOR flash takes hundreds of ms (a sector erase is up
-/// to 400 ms on the W25Q16JV). Time-critical code uses the `try_*` methods, which never wait and never
-/// do I/O.
+/// to 400 ms on the W25Q16JV). Time-critical code uses the `try_*` methods, which return
+/// [`Error::Busy`] instead of waiting while the storage is busy with another operation. They still
+/// load an object that is not in RAM.
 ///
 /// # Deadlock
 ///
@@ -123,26 +124,28 @@ impl<B: Backend> TierMem<B> {
         todo!("Marius: lock (wait), load if needed, run f, mark modified")
     }
 
-    /// Like [`with`](Self::with), but never waits: returns [`Error::Busy`] if the storage is in use
-    /// or the object is not in RAM.
+    /// Like [`with`](Self::with), but returns [`Error::Busy`] instead of waiting if the storage is
+    /// busy with another operation (for example a write or an erase). Loads the object if it is not
+    /// in RAM.
     pub fn try_with<T: Storable, R>(
         &self,
         handle: &Handle<T>,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, Error<B::Error>> {
         let _ = (handle, f);
-        todo!("Marius: try to lock, Busy if locked or not resident, run f")
+        todo!("Marius: try to lock (Busy if locked), load if needed, run f")
     }
 
-    /// Like [`with_mut`](Self::with_mut), but never waits: returns [`Error::Busy`] if the storage is
-    /// in use or the object is not in RAM.
+    /// Like [`with_mut`](Self::with_mut), but returns [`Error::Busy`] instead of waiting if the
+    /// storage is busy with another operation (for example a write or an erase). Loads the object if
+    /// it is not in RAM.
     pub fn try_with_mut<T: Storable, R>(
         &self,
         handle: &Handle<T>,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, Error<B::Error>> {
         let _ = (handle, f);
-        todo!("Marius: try to lock, Busy if locked or not resident, run f, mark modified")
+        todo!("Marius: try to lock (Busy if locked), load if needed, run f, mark modified")
     }
 
     /// Writes every modified object back to the backend. Waits if the storage is busy.
