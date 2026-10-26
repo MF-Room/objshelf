@@ -20,10 +20,8 @@ use crate::{Error, Handle, Storable};
 /// let settings: Handle<Settings> = mem.get_or_insert_with("settings", Settings::default)?;
 /// let bpm = mem.with(&settings, |s| s.bpm)?; // waits if the storage is busy
 /// mem.with_mut(&settings, |s| s.bpm = 120)?;
-/// match mem.try_with(&settings, |s| s.bpm) { // returns Busy instead of waiting
-///     Err(Error::Busy) => { /* try again later */ }
-///     result => { /* ... */ }
-/// }
+/// let bpm = mem.try_with(&settings, |s| s.bpm)?.unwrap_or(bpm); // `None` if busy, never waits
+/// if mem.try_with_mut(&settings, |s| s.bpm = 120)?.is_none() { /* try again later */ }
 /// mem.flush()?; // modified objects go to the backend
 /// ```
 ///
@@ -34,8 +32,8 @@ use crate::{Error, Handle, Storable};
 /// price is that blocking calls hold the CPU during storage I/O: loading an object takes a few ms,
 /// and a write that needs garbage collection on NOR flash takes hundreds of ms (a sector erase is up
 /// to 400 ms on the W25Q16JV). Time-critical code uses the `try_*` methods, which return
-/// [`Error::Busy`] instead of waiting while the storage is busy with another operation. They still
-/// load an object that is not in RAM.
+/// `Ok(None)` instead of waiting while the storage is busy with another operation. They still load
+/// an object that is not in RAM.
 ///
 /// # Deadlock
 ///
@@ -43,7 +41,7 @@ use crate::{Error, Handle, Storable};
 /// interrupt (or a higher-priority executor) while lower-priority code holds the storage waits
 /// forever, since that code cannot run to release it. Call blocking methods from one priority level
 /// only, and `try_*` methods everywhere else. For the same reason, a closure must not call back into
-/// the same `TierMem`: a blocking call deadlocks and a `try_*` call returns [`Error::Busy`].
+/// the same `TierMem`: a blocking call deadlocks and a `try_*` call returns `Ok(None)`.
 ///
 /// # Durability
 ///
@@ -140,28 +138,31 @@ impl<B: Backend> TierMem<B> {
         todo!("Marius: lock (wait), load if needed, run f, mark modified")
     }
 
-    /// Like [`with`](Self::with), but returns [`Error::Busy`] instead of waiting if the storage is
-    /// busy with another operation (for example a write or an erase). Loads the object if it is not
-    /// in RAM.
+    /// Like [`with`](Self::with), but never waits for the storage: returns `Ok(None)` without
+    /// running `f` if the storage is busy with another operation (for example a write or an erase).
+    /// Loads the object if it is not in RAM.
+    ///
+    /// Real errors still come as `Err`, so `?` and the `Option` methods replace a `match`:
+    /// `mem.try_with(&h, |s| s.bpm)?.unwrap_or(last_bpm)`.
     pub fn try_with<T: Storable, R>(
         &self,
         handle: &Handle<T>,
         f: impl FnOnce(&T) -> R,
-    ) -> Result<R, Error<B::Error>> {
+    ) -> Result<Option<R>, Error<B::Error>> {
         let _ = (handle, f);
-        todo!("Marius: try to lock (Busy if locked), load if needed, run f")
+        todo!("Marius: try to lock (None if locked), load if needed, run f")
     }
 
-    /// Like [`with_mut`](Self::with_mut), but returns [`Error::Busy`] instead of waiting if the
-    /// storage is busy with another operation (for example a write or an erase). Loads the object if
-    /// it is not in RAM.
+    /// Like [`with_mut`](Self::with_mut), but never waits for the storage: returns `Ok(None)`
+    /// without running `f` (so without changing the object) if the storage is busy with another
+    /// operation (for example a write or an erase). Loads the object if it is not in RAM.
     pub fn try_with_mut<T: Storable, R>(
         &self,
         handle: &Handle<T>,
         f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, Error<B::Error>> {
+    ) -> Result<Option<R>, Error<B::Error>> {
         let _ = (handle, f);
-        todo!("Marius: try to lock (Busy if locked), load if needed, run f, mark modified")
+        todo!("Marius: try to lock (None if locked), load if needed, run f, mark modified")
     }
 
     /// Writes every modified object back to the backend. Waits if the storage is busy.

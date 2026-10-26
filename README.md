@@ -46,11 +46,10 @@ fn run<F: NorFlash>(flash: F) -> Result<(), Error<NorError<F::Error>>> {
     let brightness = mem.with(&settings, |s| s.brightness)?;
     mem.with_mut(&settings, |s| s.timeout_s = 30)?;
 
-    // Non-waiting access, for time-critical code.
-    match mem.try_with(&settings, |s| s.brightness) {
-        Ok(brightness) => {}
-        Err(Error::Busy) => { /* try again later */ }
-        Err(error) => return Err(error),
+    // Non-waiting access, for time-critical code: `Ok(None)` if the storage is busy.
+    let brightness = mem.try_with(&settings, |s| s.brightness)?.unwrap_or(brightness);
+    if mem.try_with_mut(&settings, |s| s.brightness = 80)?.is_none() {
+        // busy: try again later
     }
 
     // Modified objects are written to flash on eviction, `flush` or `unmount`.
