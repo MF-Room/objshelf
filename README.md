@@ -3,6 +3,75 @@
 Software-managed object memory for embedded Rust, with typed access, transparent residency, and pluggable
 storage backends.
 
+## Quick start
+
+> Status: the `TierMem` API is defined, its implementation is not written yet (`todo!`).
+
+You need:
+
+* a heap (`alloc`): a global allocator, for example [`embedded-alloc`](https://crates.io/crates/embedded-alloc);
+* a backend. The NOR backend runs on any `embedded_storage_async::nor_flash::NorFlash` implementation with
+  `READ_SIZE` and `WRITE_SIZE` of 1 and an `ERASE_SIZE` that is a multiple of 256: an SPI NOR driver,
+  internal MCU flash, or a RAM simulation for tests.
+
+```toml
+[dependencies]
+tiermem = { git = "https://github.com/MF-Room/tiermem" }
+embedded-storage-async = "0.4"
+serde = { version = "1", default-features = false, features = ["derive"] }
+```
+
+```rust
+use embedded_storage_async::nor_flash::NorFlash;
+use serde::{Deserialize, Serialize};
+use tiermem::backend::nor::{NorBackend, NorConfig, NorError};
+use tiermem::{Error, Handle, TierMem};
+
+// Any `Serialize + Deserialize` type can be stored.
+#[derive(Default, Serialize, Deserialize)]
+struct Settings {
+    brightness: u8,
+    timeout_s: u16,
+}
+
+fn run<F: NorFlash>(flash: F) -> Result<(), Error<NorError<F::Error>>> {
+    // Region used by tiermem: aligned to `F::ERASE_SIZE`, at least 2 sectors.
+    let range = 0..64 * F::ERASE_SIZE as u32;
+    let mem = TierMem::<NorBackend<F>>::mount(NorConfig { flash, range })?;
+
+    // Find the object again after a reboot, or create it the first time.
+    let settings: Handle<Settings> = match mem.get("settings") {
+        Ok(handle) => handle,
+        Err(Error::NotFound) => mem.insert("settings", Settings::default())?,
+        Err(error) => return Err(error),
+    };
+
+    // Blocking access: waits if the storage is busy.
+    let brightness = mem.with(&settings, |s| s.brightness)?;
+    mem.with_mut(&settings, |s| s.timeout_s = 30)?;
+
+    // Non-waiting access, for time-critical code.
+    match mem.try_with(&settings, |s| s.brightness) {
+        Ok(brightness) => {}
+        Err(Error::Busy) => { /* try again later */ }
+        Err(error) => return Err(error),
+    }
+
+    // Modified objects are written to flash on eviction, `flush` or `unmount`.
+    mem.flush()?;
+    mem.unmount()
+}
+```
+
+* `mem.list()` returns the names of all stored objects.
+* To share the memory between tasks, put it in a `static` (for example with `static_cell`) and pass
+  `&'static TierMem<..>`. Handles are `Copy` and can be stored anywhere.
+* The API is blocking: storage operations run to completion and cannot be cancelled. A blocking call
+  holds the CPU during storage I/O (up to hundreds of ms when NOR garbage collection runs). On a single
+  core, call blocking methods from one priority level only, and `try_*` methods from interrupts and
+  time-critical code; otherwise a blocking call can wait forever on a storage that lower-priority code
+  holds. See the `TierMem` documentation.
+
 ## NOR flash backend
 
 `src/backend/nor`: async object store on any `embedded_storage_async::nor_flash::NorFlash` with 1-byte
