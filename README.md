@@ -88,10 +88,6 @@ Requirements, guarantees, time and space complexity: module documentation in
 
 ## TODO
 
-- [ ] Decide on the SPI NOR driver: use an existing one or write a generic one.
-  Existing: [`w25`](https://github.com/tweedegolf/w25) (Winbond W25 Q/X series, embedded-hal-async 1.0,
-  implements the async `NorFlash` traits). Normal read only (≤ 50 MHz), no timeouts on BUSY, does not handle
-  write protection, 3-byte addresses only.
 - [x] Reuse a store crate (`sequential-storage`, `ekv`, `littlefs2`) or write one: own store
 - [ ] When to run garbage collection. Today it only runs inside a `write` that lacks space, so that write
   also pays for relocations and erases (up to 400 ms per sector). Options: run it in idle time,
@@ -127,4 +123,3 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [ ] Max object size, flash region used by tiermem
 - [ ] Schema versioning and migration of stored types
 - [x] Host tests with a simulated `NorFlash` (power cuts, two geometries), `cargo test` in CI
-- [ ] Hardware tests on the MSeq PCB through [mseq_pcb_tb](https://github.com/MF-Room/mseq_pcb_tb)
