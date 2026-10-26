@@ -40,11 +40,7 @@ fn run<F: NorFlash>(flash: F) -> Result<(), Error<NorError<F::Error>>> {
     let mem = TierMem::<NorBackend<F>>::mount(NorConfig { flash, range })?;
 
     // Find the object again after a reboot, or create it the first time.
-    let settings: Handle<Settings> = match mem.get("settings") {
-        Ok(handle) => handle,
-        Err(Error::NotFound) => mem.insert("settings", Settings::default())?,
-        Err(error) => return Err(error),
-    };
+    let settings: Handle<Settings> = mem.get_or_insert_with("settings", Settings::default)?;
 
     // Blocking access: waits if the storage is busy.
     let brightness = mem.with(&settings, |s| s.brightness)?;
@@ -63,7 +59,8 @@ fn run<F: NorFlash>(flash: F) -> Result<(), Error<NorError<F::Error>>> {
 }
 ```
 
-* `mem.list()` returns the names of all stored objects.
+* `mem.list()` returns the names of all stored objects. `get` fails with `NotFound` if the object does not
+  exist, `insert` with `AlreadyExists` if it does.
 * To share the memory between tasks, put it in a `static` (for example with `static_cell`) and pass
   `&'static TierMem<..>`. Handles are `Copy` and can be stored anywhere.
 * The API is blocking: storage operations run to completion and cannot be cancelled. A blocking call

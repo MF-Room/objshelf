@@ -9,15 +9,15 @@ use crate::{Error, Handle, Storable};
 
 /// Object memory on top of a storage [`Backend`].
 ///
-/// Objects have a name and a type. [`list`](Self::list) returns the names, [`get`](Self::get) and
-/// [`insert`](Self::insert) return a typed [`Handle`], and every access to an object goes through a
-/// closure given to one of the `with*` methods, so no reference to it escapes.
+/// Objects have a name and a type. [`list`](Self::list) returns the names, [`get`](Self::get),
+/// [`insert`](Self::insert) and [`get_or_insert_with`](Self::get_or_insert_with) return a typed [`Handle`], and
+/// every access to an object goes through a closure given to one of the `with*` methods, so no
+/// reference to it escapes.
 ///
 /// ```ignore
 /// let mem = TierMem::<NorBackend<Flash>>::mount(NorConfig { flash, range })?;
 /// for name in mem.list()? { /* ... */ }
-/// let settings: Handle<Settings> = mem.insert("settings", Settings::default())?;
-/// let settings: Handle<Settings> = mem.get("settings")?;
+/// let settings: Handle<Settings> = mem.get_or_insert_with("settings", Settings::default)?;
 /// let bpm = mem.with(&settings, |s| s.bpm)?; // waits if the storage is busy
 /// mem.with_mut(&settings, |s| s.bpm = 120)?;
 /// match mem.try_with(&settings, |s| s.bpm) { // returns Busy instead of waiting
@@ -91,6 +91,22 @@ impl<B: Backend> TierMem<B> {
     pub fn insert<T: Storable>(&self, name: &str, value: T) -> Result<Handle<T>, Error<B::Error>> {
         let _ = (name, value);
         todo!("Marius: allocate an ObjectId, write the value and the directory entry")
+    }
+
+    /// Handle to the object `name`. If there is no object with this name (as on the first boot),
+    /// stores the value returned by `f` first; `f` only runs in that case. Waits if the storage is
+    /// busy.
+    ///
+    /// `T` must be the type the object was inserted with.
+    pub fn get_or_insert_with<T: Storable>(
+        &self,
+        name: &str,
+        f: impl FnOnce() -> T,
+    ) -> Result<Handle<T>, Error<B::Error>> {
+        let _ = (name, f);
+        todo!(
+            "Marius: get, or insert f() if NotFound, under one lock so no other insert comes between"
+        )
     }
 
     /// Removes the object of `handle`. It is durable when this returns. Waits if the storage is
