@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::mock::{Cut, MockError, MockFlash};
 use super::{NorBackend, NorConfig, NorError};
 use crate::ObjectId;
-use crate::backend::Backend;
+use crate::backend::{Backend, Usage};
 
 /// 1 KiB sectors: a header page and 3 data pages, so garbage collection runs often.
 type SmallFlash = MockFlash<1024>;
@@ -118,9 +118,58 @@ fn garbage_collection_reuses_space() {
         assert_eq!(read(&mut backend, id), Some(bytes(last as u8, 100)));
     }
     // Wear is spread over every sector.
-    let counts: Vec<u32> = backend.sectors.iter().map(|s| s.erase_count).collect();
+    let counts: Vec<u32> = backend.erase_counts().collect();
     let (min, max) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
     assert!(max - min <= 2, "erase counts {counts:?}");
+}
+
+#[test]
+fn usage() {
+    // 4 sectors of 3 data pages, one kept for garbage collection.
+    let page = 235;
+    let mut backend = mount(SmallFlash::new(4));
+    let empty = Usage {
+        capacity: 9 * page,
+        used: 0,
+        free: 9 * page,
+        reclaimable: 0,
+        objects: 0,
+    };
+    assert_eq!(backend.usage(), empty);
+
+    write(&mut backend, 1, &bytes(1, 300));
+    write(&mut backend, 2, &bytes(2, 10));
+    let two_objects = Usage {
+        used: 3 * page,
+        free: 6 * page,
+        objects: 2,
+        ..empty
+    };
+    assert_eq!(backend.usage(), two_objects);
+
+    // The old version of object 2 becomes garbage, then object 1 too.
+    write(&mut backend, 2, &bytes(3, 10));
+    block_on(backend.remove(ObjectId(1))).unwrap();
+    let after_remove = Usage {
+        used: page,
+        free: 5 * page,
+        reclaimable: 3 * page,
+        objects: 1,
+        ..empty
+    };
+    assert_eq!(backend.usage(), after_remove);
+    assert_eq!(reboot(backend).usage(), after_remove);
+}
+
+#[test]
+fn usage_adds_up_while_collecting() {
+    let mut backend = mount(SmallFlash::new(4));
+    for round in 0..100u32 {
+        write(&mut backend, round % 3, &bytes(round as u8, 100));
+        let usage = backend.usage();
+        assert_eq!(usage.used + usage.free + usage.reclaimable, usage.capacity);
+        assert_eq!(usage.objects, 3.min(round as usize + 1));
+    }
 }
 
 #[test]

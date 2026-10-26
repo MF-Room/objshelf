@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Usage};
 use crate::{Error, Handle, Storable};
 
 /// Object memory on top of a storage [`Backend`].
@@ -163,6 +163,13 @@ impl<B: Backend> TierMem<B> {
     ) -> Result<Option<R>, Error<B::Error>> {
         let _ = (handle, f);
         todo!("Marius: try to lock (None if locked), load if needed, run f, mark modified")
+    }
+
+    /// How the backend's space is used (see [`Usage`]). Waits if the storage is busy.
+    ///
+    /// Objects modified in RAM but not written back yet count with their stored size.
+    pub fn usage(&self) -> Result<Usage, Error<B::Error>> {
+        todo!("Marius: lock (wait), backend.usage()")
     }
 
     /// Writes every modified object back to the backend. Waits if the storage is busy.

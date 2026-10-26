@@ -31,8 +31,31 @@ pub trait Backend: Sized {
     /// Removes the object `id`. The removal is durable when this returns.
     async fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error>;
 
+    /// How the storage space is used. Computed from the backend's RAM state, without I/O.
+    fn usage(&self) -> Usage;
+
     /// Closes the storage. Nothing needs saving: writes are already durable.
     async fn unmount(self) -> Result<(), Self::Error> {
         Ok(())
     }
+}
+
+/// Space of a backend, in bytes of serialized objects.
+///
+/// A backend can store data in fixed-size units (pages on NOR flash), so a small object takes a
+/// whole unit: `used` counts whole units, and an object of `n` bytes may need more than `n` of
+/// `free`. `used + free + reclaimable` is at most `capacity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Usage {
+    /// Bytes the backend can hold, without its metadata and reserved space.
+    pub capacity: usize,
+    /// Bytes taken by the stored objects.
+    pub used: usize,
+    /// Bytes writable now.
+    pub free: usize,
+    /// Bytes taken by replaced or removed objects, writable once reclaimed (on NOR flash, by
+    /// garbage collection, which erases sectors and can take hundreds of ms).
+    pub reclaimable: usize,
+    /// Number of stored objects.
+    pub objects: usize,
 }

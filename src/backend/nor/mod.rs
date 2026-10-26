@@ -36,6 +36,7 @@
 //! | `read` | `k` page reads | `O(len)` |
 //! | `write`, no GC | `k` blank-check reads, `k` page writes, `k'` 1-byte writes | `O(len + S)` |
 //! | `remove` | `k'` 1-byte writes | `O(k')` |
+//! | `usage` | none | `O(S)` |
 //! | GC, per sector reclaimed | up to `2 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 2 small writes | `O(S + P)` |
 //!
 //! Hash map operations are expected `O(1)`. Garbage collection only runs inside a `write` that
@@ -74,7 +75,7 @@ use embedded_storage_async::nor_flash::NorFlash;
 use hashbrown::HashMap;
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::Backend;
+use super::{Backend, Usage};
 use crate::ObjectId;
 use layout::{
     MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE, PageHeader, SectorHeader, is_blank, is_obsolete,
@@ -184,6 +185,12 @@ impl<F: NorFlash> NorBackend<F> {
             Some(spare) => self.active_free_pages() + spare * Self::DATA_PAGES,
             None => 0,
         }
+    }
+
+    /// Erase count of each sector of the region, in address order. A sector whose header was lost
+    /// (an erase cut by a power loss) restarts at 0.
+    pub fn erase_counts(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.sectors.iter().map(|s| s.erase_count)
     }
 
     async fn read_page(&mut self, page: usize) -> Result<[u8; PAGE_SIZE], NorError<F::Error>> {
@@ -529,5 +536,20 @@ impl<F: NorFlash> Backend for NorBackend<F> {
     async fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error> {
         let object = self.objects.remove(&id).ok_or(NorError::NotFound)?;
         self.release(&object.pages).await
+    }
+
+    /// In whole pages of 235 payload bytes. `capacity` leaves out the sector headers and the
+    /// sector kept for garbage collection; `free` is what a write can use without collecting.
+    fn usage(&self) -> Usage {
+        let user_sectors = self.sectors.len() - RESERVED_SECTORS;
+        let used: usize = self.sectors.iter().map(|s| s.live).sum();
+        let garbage: usize = (0..self.sectors.len()).map(|s| self.garbage(s)).sum();
+        Usage {
+            capacity: user_sectors * Self::DATA_PAGES * PAYLOAD_SIZE,
+            used: used * PAYLOAD_SIZE,
+            free: self.user_free_pages() * PAYLOAD_SIZE,
+            reclaimable: garbage * PAYLOAD_SIZE,
+            objects: self.objects.len(),
+        }
     }
 }

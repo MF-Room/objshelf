@@ -58,8 +58,9 @@ fn run<F: NorFlash>(flash: F) -> Result<(), Error<NorError<F::Error>>> {
 }
 ```
 
-* `mem.list()` returns the names of all stored objects. `get` fails with `NotFound` if the object does not
-  exist, `insert` with `AlreadyExists` if it does.
+* `mem.list()` returns the names of all stored objects, `mem.usage()` the capacity and the space used,
+  free and reclaimable by garbage collection. `get` fails with `NotFound` if the object does not exist,
+  `insert` with `AlreadyExists` if it does.
 * To share the memory between tasks, put it in a `static` (for example with `static_cell`) and pass
   `&'static TierMem<..>`. Handles are `Copy` and can be stored anywhere.
 * The API is blocking: storage operations run to completion and cannot be cancelled. A blocking call
