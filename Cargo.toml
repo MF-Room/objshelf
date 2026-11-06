@@ -4,10 +4,18 @@ version = "0.1.0"
 edition = "2024"
 description = "Software-managed object memory for embedded Rust, with typed access, transparent residency, and pluggable storage backends."
 
+[workspace]
+members = ["tiermem-macros"]
+
 [dependencies]
 crc = "3.4.0"
-embassy-futures = "0.1.2"
 embedded-storage-async = "0.4.2"
+get-size2 = { version = "0.11", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher"] }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
-serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+rtic-core = "1"
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive"] }
+tiermem-macros = { path = "tiermem-macros", version = "0.1.0" }
+
+[dev-dependencies]
+embassy-futures = "0.1.2"

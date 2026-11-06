@@ -62,7 +62,7 @@
 
 mod layout;
 #[cfg(test)]
-mod mock;
+pub(crate) mod mock;
 #[cfg(test)]
 mod tests;
 
@@ -191,6 +191,12 @@ impl<F: NorFlash> NorBackend<F> {
     /// (an erase cut by a power loss) restarts at 0.
     pub fn erase_counts(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
         self.sectors.iter().map(|s| s.erase_count)
+    }
+
+    /// The flash driver, to mount the same flash again as after a reboot.
+    #[cfg(test)]
+    pub(crate) fn into_flash(self) -> F {
+        self.flash
     }
 
     async fn read_page(&mut self, page: usize) -> Result<[u8; PAGE_SIZE], NorError<F::Error>> {
@@ -436,7 +442,7 @@ impl<F: NorFlash> NorBackend<F> {
     }
 }
 
-impl<F: NorFlash> Backend for NorBackend<F> {
+impl<F: NorFlash + 'static> Backend for NorBackend<F> {
     type Error = NorError<F::Error>;
     type Config = NorConfig<F>;
 
@@ -551,5 +557,9 @@ impl<F: NorFlash> Backend for NorBackend<F> {
             reclaimable: garbage * PAYLOAD_SIZE,
             objects: self.objects.len(),
         }
+    }
+
+    fn ids(&self) -> Vec<ObjectId> {
+        self.objects.keys().copied().collect()
     }
 }

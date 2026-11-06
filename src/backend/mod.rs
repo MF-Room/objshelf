@@ -2,6 +2,8 @@
 
 pub mod nor;
 
+use alloc::vec::Vec;
+
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::ObjectId;
@@ -9,11 +11,12 @@ use crate::ObjectId;
 /// Persistent store of serialized objects, addressed by `ObjectId`.
 ///
 /// One operation runs at a time (`&mut self`). Storage futures must not be cancelled: a dropped
-/// operation can leave the backend's RAM state out of sync with the storage. `TierMem` runs each
-/// of them to completion with `block_on`, so this only concerns code that awaits a backend directly.
-// The futures don't need to be `Send`: `TierMem` polls them in place.
+/// operation can leave the backend's RAM state out of sync with the storage. The `TierMem` runner
+/// awaits each of them to completion.
+// The futures don't need to be `Send`: the runner polls them in place. `'static` because
+// `TierMem` erases the types of the objects it caches, which names the backend.
 #[allow(async_fn_in_trait)]
-pub trait Backend: Sized {
+pub trait Backend: Sized + 'static {
     /// Errors of the backend and of its storage driver.
     type Error;
     /// What `mount` needs: the storage driver and its settings.
@@ -33,6 +36,10 @@ pub trait Backend: Sized {
 
     /// How the storage space is used. Computed from the backend's RAM state, without I/O.
     fn usage(&self) -> Usage;
+
+    /// Ids of all the stored objects, in no particular order. Computed from the backend's RAM
+    /// state, without I/O.
+    fn ids(&self) -> Vec<ObjectId>;
 
     /// Closes the storage. Nothing needs saving: writes are already durable.
     async fn unmount(self) -> Result<(), Self::Error> {

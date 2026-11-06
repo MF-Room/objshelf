@@ -2,7 +2,9 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::future::poll_fn;
 use core::ops::Range;
+use core::task::Poll;
 
 use embedded_storage_async::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
@@ -11,7 +13,7 @@ use embedded_storage_async::nor_flash::{
 use super::layout::PAGE_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MockError {
+pub(crate) enum MockError {
     OutOfBounds,
     NotAligned,
     /// The power was cut: the operation is partly done and the flash accepts nothing more.
@@ -30,40 +32,63 @@ impl NorFlashError for MockError {
 
 /// How the cut operation is left: only its first half done, or only its second half.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum Cut {
+pub(crate) enum Cut {
     FirstHalf,
     SecondHalf,
 }
 
 /// Flash with 1-byte writes and `ERASE_SIZE` sectors. Like the W25Q16JV, it only programs erased
 /// bytes and a write never crosses a 256-byte page: both panic, as they are backend bugs.
-pub(super) struct MockFlash<const ERASE_SIZE: usize> {
-    pub(super) data: Vec<u8>,
+pub(crate) struct MockFlash<const ERASE_SIZE: usize> {
+    pub(crate) data: Vec<u8>,
     /// Program and erase operations done so far.
     pub(super) ops: usize,
     cut: Option<(usize, Cut)>,
     dead: bool,
+    /// Times each operation returns `Pending` before it runs.
+    pending: usize,
 }
 
 impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
-    pub(super) fn new(sectors: usize) -> Self {
+    pub(crate) fn new(sectors: usize) -> Self {
         Self::with_data(vec![0xFF; sectors * ERASE_SIZE])
     }
 
     /// The same flash after a reboot.
-    pub(super) fn with_data(data: Vec<u8>) -> Self {
+    pub(crate) fn with_data(data: Vec<u8>) -> Self {
         Self {
             data,
             ops: 0,
             cut: None,
             dead: false,
+            pending: 0,
         }
     }
 
     /// Cuts the power during program or erase operation number `op` (0-based).
-    pub(super) fn cut_at(mut self, op: usize, cut: Cut) -> Self {
+    pub(crate) fn cut_at(mut self, op: usize, cut: Cut) -> Self {
         self.cut = Some((op, cut));
         self
+    }
+
+    /// Makes each operation return `Pending` `times` times (waking its task) before it runs, as a
+    /// driver waiting for the bus or the chip.
+    pub(crate) fn pending(mut self, times: usize) -> Self {
+        self.pending = times;
+        self
+    }
+
+    async fn wait(&self) {
+        let mut left = self.pending;
+        poll_fn(|cx| {
+            if left == 0 {
+                return Poll::Ready(());
+            }
+            left -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
     }
 
     /// Counts a program or erase operation and returns how it is cut, if it is.
@@ -109,6 +134,7 @@ impl<const ERASE_SIZE: usize> ReadNorFlash for MockFlash<ERASE_SIZE> {
     const READ_SIZE: usize = 1;
 
     async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.wait().await;
         if self.dead {
             return Err(MockError::PowerCut);
         }
@@ -127,6 +153,7 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
     const ERASE_SIZE: usize = ERASE_SIZE;
 
     async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        self.wait().await;
         if from > to
             || !(from as usize).is_multiple_of(ERASE_SIZE)
             || !(to as usize).is_multiple_of(ERASE_SIZE)
@@ -140,6 +167,7 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
     }
 
     async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.wait().await;
         let range = self.check(offset, bytes.len())?;
         if let (Some(first), Some(last)) = (range.clone().next(), range.clone().last()) {
             assert_eq!(

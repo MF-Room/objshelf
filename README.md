@@ -5,11 +5,11 @@ storage backends.
 
 ## Quick start
 
-> Status: the `TierMem` API is defined, its implementation is not written yet (`todo!`).
-
 You need:
 
 * a heap (`alloc`): a global allocator, for example [`embedded-alloc`](https://crates.io/crates/embedded-alloc);
+* an async executor with shared resources, written for [RTIC 2](https://rtic.rs): `TierMem` is a
+  `#[shared]` resource, accessed through any `rtic::Mutex` (`tiermem::Mutex`);
 * a backend. The NOR backend runs on any `embedded_storage_async::nor_flash::NorFlash` implementation with
   `READ_SIZE` and `WRITE_SIZE` of 1 and an `ERASE_SIZE` that is a multiple of 256: an SPI NOR driver,
   internal MCU flash, or a RAM simulation for tests.
@@ -17,57 +17,86 @@ You need:
 ```toml
 [dependencies]
 tiermem = { git = "https://github.com/MF-Room/tiermem" }
-embedded-storage-async = "0.4"
-serde = { version = "1", default-features = false, features = ["derive"] }
 ```
+
+Two parts:
+
+* `TierMem`, the RAM side: names, cached objects, RAM budget. A `#[shared]` resource. Its methods never
+  wait and never do I/O, so every lock is short.
+* `Runner`, the `#[local]` resource of a low-priority task: it owns the backend and does all the I/O
+  (mount, loads, write-backs, flushes), locking `TierMem` only between operations.
 
 ```rust
-use embedded_storage_async::nor_flash::NorFlash;
-use serde::{Deserialize, Serialize};
-use tiermem::backend::nor::{NorBackend, NorConfig, NorError};
-use tiermem::{Error, Handle, TierMem};
+use tiermem::backend::nor::{NorBackend, NorConfig};
+use tiermem::{Handle, Runner, TierMem, storable};
 
-// Any `Serialize + Deserialize` type can be stored.
-#[derive(Default, Serialize, Deserialize)]
+// Serialize, Deserialize and GetSize (RAM accounting). Put it before `#[derive]`.
+#[storable]
+#[derive(Default)]
 struct Settings {
-    brightness: u8,
-    timeout_s: u16,
+    bpm: u16,
+    name: String,
 }
 
-fn run<F: NorFlash>(flash: F) -> Result<(), Error<NorError<F::Error>>> {
-    // Region used by tiermem: aligned to `F::ERASE_SIZE`, at least 2 sectors.
-    let range = 0..64 * F::ERASE_SIZE as u32;
-    let mem = TierMem::<NorBackend<F>>::mount(NorConfig { flash, range })?;
+#[shared]
+struct Shared {
+    mem: TierMem<NorBackend<Flash>>,
+}
 
+#[local]
+struct Local {
+    runner: Runner<NorBackend<Flash>>,
+}
+
+#[init]
+fn init(cx: init::Context) -> (Shared, Local) {
+    // Region used by tiermem: aligned to the erase size, at least 2 sectors.
+    let config = NorConfig { flash, range: 0..64 * 4096 };
+    storage::spawn().unwrap();
+    // 16 KiB of RAM for cached objects.
+    (Shared { mem: TierMem::new(16 * 1024) }, Local { runner: Runner::new(config) })
+}
+
+#[task(priority = 1, shared = [mem], local = [runner])]
+async fn storage(mut cx: storage::Context) {
+    // Mounts, then serves loads, write-backs and flushes. Returns after `unmount`, or on a mount error.
+    let result = cx.local.runner.run(&mut cx.shared.mem).await;
+}
+
+#[task(priority = 2, shared = [mem])]
+async fn app(mut cx: app::Context) {
+    tiermem::mounted(&mut cx.shared.mem).await?;
     // Find the object again after a reboot, or create it the first time.
-    let settings: Handle<Settings> = mem.get_or_insert_with("settings", Settings::default)?;
+    let settings: Handle<Settings> =
+        cx.shared.mem.lock(|m| m.get_or_insert_with("settings", Settings::default))?;
+    // Waits for the load if the object is not in RAM.
+    let bpm = tiermem::with(&mut cx.shared.mem, &settings, |s| s.bpm).await?;
+    tiermem::with_mut(&mut cx.shared.mem, &settings, |s| s.bpm = 120).await?;
+    // Modified objects are written on eviction, `flush` or `unmount`.
+    tiermem::flush(&mut cx.shared.mem).await?;
+}
 
-    // Blocking access: waits if the storage is busy.
-    let brightness = mem.with(&settings, |s| s.brightness)?;
-    mem.with_mut(&settings, |s| s.timeout_s = 30)?;
-
-    // Non-waiting access, for time-critical code: `Ok(None)` if the storage is busy.
-    let brightness = mem.try_with(&settings, |s| s.brightness)?.unwrap_or(brightness);
-    if mem.try_with_mut(&settings, |s| s.brightness = 80)?.is_none() {
-        // busy: try again later
-    }
-
-    // Modified objects are written to flash on eviction, `flush` or `unmount`.
-    mem.flush()?;
-    mem.unmount()
+#[task(binds = TIM2, priority = 3, shared = [mem])]
+fn tick(mut cx: tick::Context) {
+    // Never waits: `Ok(None)` if the object is not in RAM; its load is queued, try again later.
+    let bpm = cx.shared.mem.lock(|m| m.try_with(&SETTINGS, |s| s.bpm));
 }
 ```
 
-* `mem.list()` returns the names of all stored objects, `mem.usage()` the capacity and the space used,
-  free and reclaimable by garbage collection. `get` fails with `NotFound` if the object does not exist,
-  `insert` with `AlreadyExists` if it does.
-* To share the memory between tasks, put it in a `static` (for example with `static_cell`) and pass
-  `&'static TierMem<..>`. Handles are `Copy` and can be stored anywhere.
-* The API is blocking: storage operations run to completion and cannot be cancelled. A blocking call
-  holds the CPU during storage I/O (up to hundreds of ms when NOR garbage collection runs). On a single
-  core, call blocking methods from one priority level only, and `try_*` methods from interrupts and
-  time-critical code; otherwise a blocking call can wait forever on a storage that lower-priority code
-  holds. See the `TierMem` documentation.
+* `list()` returns the names of all objects, `usage()` the backend capacity and the space used, free and
+  reclaimable by garbage collection. `get` fails with `NotFound` if the object does not exist, `insert`
+  with `AlreadyExists` if it does, and with `TooLarge` if it doesn't fit the RAM budget. Handles are
+  `Copy` and can be stored anywhere.
+* Closures given to `with`, `with_mut`, `try_with` and `try_with_mut` run inside the lock: keep them short.
+* Durability: changes are in RAM when the call returns. They reach the backend when the object is evicted
+  (over the RAM budget, least recently used first), on `flush` or on `unmount`. A reset loses the rest.
+* Names: the whole directory is kept in RAM and rewritten when it changes, so keep names short.
+* Types: an object must be read with the type it was inserted with. A cached object of another type gives
+  `WrongType`, but the backend does not check types yet (see TODO).
+* `#[storable]` field options: `#[storable(ignore)]`, `#[storable(heap_size = expr)]`,
+  `#[storable(heap_size_fn = path)]` to adjust the heap size counted for a field.
+
+Details: `TierMem` documentation in [`src/memory/mod.rs`](src/memory/mod.rs).
 
 ## NOR flash backend
 
@@ -113,14 +142,11 @@ Requirements, guarantees, time and space complexity: module documentation in
   - first use of a fresh chip erases each sector when it is first opened (one erase per sector)
   - power cut during mount, which can write (stale pages marked obsolete): not tested yet
 - [ ] Protection policy at mount: clear or fail
-- [ ] Implement `TierMem` (`src/memory.rs`, Marius): the public API is written, the bodies are `todo!`.
-  Open points (`TODO(Marius)` in the code):
-  - lock: a busy flag (`AtomicBool`) rather than a critical section, which would disable interrupts
-    during storage I/O
-  - name → `ObjectId` mapping: a persisted directory object (e.g. id 0) or a hash of the name; max name
-    length
-  - residency: when to load and evict objects, write-back of modified objects, RAM budget
-  - type check on `get` (stored type tag or schema hash) instead of a postcard error
+- [x] Implement `TierMem` (`src/memory`): RTIC shared resource + `Runner` task, directory object (id 0),
+  LRU cache with a RAM budget and write-back, `#[storable]` macro
+- [ ] Type check on read: a stored type tag or schema hash in the backend, instead of a postcard error
+  or a wrong decode
+- [ ] Max name length; the directory is rewritten whole on every change
 - [ ] Max object size, flash region used by tiermem
 - [ ] Schema versioning and migration of stored types
 - [x] Host tests with a simulated `NorFlash` (power cuts, two geometries), `cargo test` in CI
