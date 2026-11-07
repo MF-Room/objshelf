@@ -206,8 +206,6 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [ ] Protection policy at mount: clear or fail
 - [x] Implement `TierMem` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, directory
   object (id 0), LRU read cache with a RAM budget, changes kept in RAM until a flush
-- [ ] Async flush with an async flash driver: let other tasks of the same priority run, or the CPU sleep,
-  while the flash programs or erases, instead of polling it
 - [ ] RAM accounting: the size of an object in RAM is estimated from its serialized size (spare `Vec`
   capacity is not counted)
 - [ ] The directory is a single point of failure: if it is lost (corrupted sector header), mount removes
