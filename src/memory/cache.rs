@@ -1,5 +1,6 @@
-//! Cached objects: their use by `with` and `with_mut`, reads of the ones not in RAM, and the drop
-//! of unmodified ones over the budget. Nothing here writes.
+//! Objects in RAM: `Locked::with`, behind `tiermem::with` and `tiermem::with_mut`, which reads an
+//! object from the backend if it is not in RAM, and drops unmodified objects over the budget.
+//! Nothing here writes to the backend.
 
 use alloc::boxed::Box;
 use core::any::Any;
