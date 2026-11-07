@@ -27,15 +27,14 @@ use crate::{Error, Handle, Storable};
 /// let mut mem = TierMem::<NorBackend<Flash>>::mount(config, 16 * 1024, || {
 ///     save::spawn().ok();
 /// })?;
-/// let settings: Handle<Settings> =
-///     tiermem::get_or_insert_with(&mut mem, "settings", Settings::default)?;
+/// let config: Handle<Config> = tiermem::get_or_insert_with(&mut mem, "config", Config::default)?;
 ///
 /// // in a task with `shared = [mem]`
 /// let mem = &mut cx.shared.mem;
-/// let bpm = tiermem::with(mem, &settings, |s| s.bpm)?; // reads the object if it is not in RAM
-/// tiermem::with_mut(mem, &settings, |s| s.bpm = 120)?; // in RAM until the next flush
-/// let bpm = tiermem::try_with(mem, &settings, |s| s.bpm)?.unwrap_or(bpm); // never waits
-/// if tiermem::try_with_mut(mem, &settings, |s| s.bpm = 120)?.is_none() { /* try again later */ }
+/// let volume = tiermem::with(mem, &config, |c| c.volume)?; // reads the object if not in RAM
+/// tiermem::with_mut(mem, &config, |c| c.volume = 3)?; // in RAM until the next flush
+/// let volume = tiermem::try_with(mem, &config, |c| c.volume)?.unwrap_or(volume); // never waits
+/// if tiermem::try_with_mut(mem, &config, |c| c.volume = 3)?.is_none() { /* try again later */ }
 ///
 /// // in the `save` task, of the lowest priority
 /// tiermem::flush(&mut cx.shared.mem)?; // the changes go to the backend
@@ -45,16 +44,15 @@ use crate::{Error, Handle, Storable};
 ///
 /// Only [`flush`] (and [`unmount`](Self::unmount)) writes to the backend. Changes, [`insert`] and
 /// [`remove`] included, stay in RAM until then. A flush runs in the caller's task: a few ms per
-/// object, and hundreds of ms when NOR garbage collection runs (a sector erase is up to 400 ms on
-/// the W25Q16JV). Call it from a task of the lowest priority, so that every other task keeps
-/// running meanwhile.
+/// object, and hundreds of ms when NOR garbage collection runs (a sector erase can take 400 ms on
+/// SPI NOR). Call it from a task of the lowest priority, so that every other task keeps running
+/// meanwhile.
 ///
 /// # Locking
 ///
 /// Each function takes the lock for short steps only: never wrap a call in `lock` yourself. Like
 /// every RTIC lock, it blocks the tasks that share the memory and none of the others: tasks of a
-/// higher priority that don't use it, such as a MIDI input interrupt, always keep running. The
-/// lock is held for:
+/// higher priority that don't use it always keep running. The lock is held for:
 ///
 /// - RAM work: names, changes, and the access to an object in RAM, with the closure given to the
 ///   `with*` function (keep closures short);
@@ -217,7 +215,7 @@ pub fn with_mut<T: Storable, R, B: Backend>(
 /// RAM and a flush has the storage. Reads the object if it is not in RAM and the storage is free.
 ///
 /// Real errors still come as `Err`, so `?` and the `Option` methods replace a `match`:
-/// `tiermem::try_with(mem, &h, |s| s.bpm)?.unwrap_or(last_bpm)`.
+/// `tiermem::try_with(mem, &h, |c| c.volume)?.unwrap_or(last_volume)`.
 pub fn try_with<T: Storable, R, B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
     handle: &Handle<T>,
