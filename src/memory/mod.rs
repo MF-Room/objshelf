@@ -3,7 +3,7 @@
 //! `TierMem` (`Locked`).
 //!
 //! - `object`: cached objects with their type erased.
-//! - `cache`: cached objects, their use by the `with*` and `try_*` functions, and their reads.
+//! - `cache`: cached objects, their use by `with` and `with_mut`, and their reads.
 //! - `names`: the names, `insert` and `remove`.
 //! - `write`: `flush`, the only code that writes to the backend.
 //! - `lifecycle`: mount, with the name directory (object 0), and unmount.
@@ -17,7 +17,7 @@
 //!   wait for them, and none of them ever finds a read in progress.
 //! - Writes, by `flush` only: the backend and the object to write are taken out of `Core` inside
 //!   the lock, written outside of it, and put back inside the lock. While the backend is out, the
-//!   storage is busy: a `try_*` call that needs it returns `None`, a blocking call waits.
+//!   storage is busy: a call that needs it returns `Busy`. Nothing waits.
 
 mod cache;
 mod lifecycle;
@@ -74,18 +74,6 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
     /// Runs `f` on the core, inside the lock.
     fn lock<R>(&mut self, f: impl FnOnce(&mut Core<B>) -> R) -> R {
         self.0.lock(|mem| f(&mut mem.core))
-    }
-
-    /// Runs `f` inside the lock until it returns `Some`: `None` means that a flush has the
-    /// backend. The lock is released in between. On a single core, that flush was preempted by
-    /// the caller and cannot finish: `TierMem` documents the rule that avoids it.
-    fn wait<R>(&mut self, mut f: impl FnMut(&mut Core<B>) -> Option<R>) -> R {
-        loop {
-            if let Some(result) = self.lock(&mut f) {
-                return result;
-            }
-            core::hint::spin_loop();
-        }
     }
 
     pub(crate) fn usage(&mut self) -> Usage {

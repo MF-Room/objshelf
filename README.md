@@ -70,7 +70,6 @@ fn init(cx: init::Context) -> (Shared, Local) {
     (Shared { mem }, Local { app_config: handle, timer_config: handle })
 }
 
-// `with`, `with_mut` and `flush` are called from one priority level: here the lowest.
 #[task(priority = 1, shared = [mem], local = [app_config])]
 async fn app(mut cx: app::Context) {
     let handle = cx.local.app_config;
@@ -94,43 +93,48 @@ async fn save(mut cx: save::Context) {
     tiermem::flush(&mut cx.shared.mem).unwrap();
 }
 
-// A higher priority uses the `try_*` functions, which never wait.
+// A higher priority can interrupt a flush, so it can get `Busy`.
 #[task(binds = TIM2, priority = 2, shared = [mem], local = [timer_config])]
 fn timer(mut cx: timer::Context) {
-    let volume = tiermem::try_with(&mut cx.shared.mem, cx.local.timer_config, |c| c.volume);
-    // `None` only if the object is not in RAM while a flush has the flash.
-    if let Some(volume) = volume.unwrap() {
-        // ...
+    match tiermem::with(&mut cx.shared.mem, cx.local.timer_config, |c| c.volume) {
+        Ok(volume) => { /* ... */ }
+        // The object is not in RAM and a flush has the flash: try again on the next tick.
+        Err(Error::Busy) => {}
+        Err(error) => panic!("{error:?}"),
     }
 }
 ```
 
-Tasks that don't share `mem` are never blocked by tiermem, whatever their priority.
+No function waits, so any task can call any of them. Tasks that don't share `mem` are never blocked by
+tiermem, whatever their priority.
 
 ## API
 
 In a task, `mem` is `&mut cx.shared.mem`. In `init`, before the memory is shared, it is `&mut mem` on the
 owned `TierMem`.
 
-| Function | What it does | Waits |
-|---|---|---|
-| `TierMem::mount(config, cache_bytes, on_full)` | Mounts the backend and reads the names of the stored objects. `cache_bytes` is the RAM budget, `on_full` is called when unflushed changes fill it. | Blocks: for `init` |
-| `TierMem::unmount(self)` | Flushes, then unmounts the backend. | Blocks |
-| `list(mem)` | Names of all objects. | Never |
-| `get::<T, _>(mem, name)` | Handle to the object `name`, of type `T`. `NotFound` if it doesn't exist. | Never |
-| `insert(mem, name, value)` | Adds a new object and returns its handle. `AlreadyExists` if the name is taken. | Never |
-| `get_or_insert_with(mem, name, f)` | Handle to the object `name`, inserting `f()` first if it doesn't exist (first boot). | Never |
-| `remove(mem, handle)` | Removes the object. | Never |
-| `with(mem, &handle, \|v\| ...)` | Runs the closure on the object and returns its result. Reads the object from flash first if it is not in RAM. | During a flush, if the object is not in RAM |
-| `with_mut(mem, &handle, \|v\| ...)` | Same, with mutable access. The change stays in RAM until the next flush. | Same as `with` |
-| `try_with(mem, &handle, \|v\| ...)` | Like `with`, but returns `Ok(None)` instead of waiting. | Never |
-| `try_with_mut(mem, &handle, \|v\| ...)` | Like `with_mut`, but returns `Ok(None)` instead of waiting. | Never |
-| `usage(mem)` | Space of the backend: capacity, used, free, reclaimable by garbage collection, number of objects. | Never |
-| `flush(mem)` | Writes the changes to the flash: changed and new objects, then the names, then the removals. | Writes |
+| Function | What it does |
+|---|---|
+| `TierMem::mount(config, cache_bytes, on_full)` | Mounts the backend and reads the names of the stored objects, blocking (for `init`). `cache_bytes` is the RAM budget, `on_full` is called when unflushed changes fill it. |
+| `TierMem::unmount(self)` | Flushes, then unmounts the backend. |
+| `list(mem)` | Names of all objects. |
+| `get::<T, _>(mem, name)` | Handle to the object `name`, of type `T`. `NotFound` if it doesn't exist. |
+| `insert(mem, name, value)` | Adds a new object and returns its handle. `AlreadyExists` if the name is taken. |
+| `get_or_insert_with(mem, name, f)` | Handle to the object `name`, inserting `f()` first if it doesn't exist (first boot). |
+| `remove(mem, handle)` | Removes the object. |
+| `with(mem, &handle, \|v\| ...)` | Runs the closure on the object and returns its result. Reads the object from flash first if it is not in RAM. |
+| `with_mut(mem, &handle, \|v\| ...)` | Same, with mutable access. The change stays in RAM until the next flush. |
+| `usage(mem)` | Space of the backend: capacity, used, free, reclaimable by garbage collection, number of objects. |
+| `flush(mem)` | Writes the changes to the flash: changed and new objects, then the names, then the removals. |
 
-`insert`, `with_mut` and `try_with_mut` return `Error::Full`, without changing anything, when unflushed
-changes fill the RAM budget. The other errors are `NotFound`, `AlreadyExists`, `WrongType` (the handle's
-type is not the object's) and `Backend` (the flash failed).
+Errors, besides `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is not the object's) and
+`Backend` (the flash failed):
+
+* `Full`: `insert` and `with_mut` change nothing when unflushed changes fill the RAM budget. `on_full` was
+  called to start a flush; try again once it is done.
+* `Busy`: `with` and `with_mut` need the flash (the object is not in RAM, or is being written) while a
+  flush has it, or `flush` interrupted another flush. Nothing was done; try again later. Only a task of a
+  higher priority than the flush, which interrupts it, can get it.
 
 ## How it works
 
@@ -139,13 +143,12 @@ type is not the object's) and `Backend` (the flash failed).
   the lowest priority, so that every other task keeps running.
 * **Locking.** Each function takes the lock of `mem` for short steps only: never call them inside
   `cx.shared.mem.lock(...)`. The lock blocks the tasks that share `mem`, up to the highest priority among
-  them, and no other task. It is held for RAM work, for the closures given to the `with*` functions (keep
+  them, and no other task. It is held for RAM work, for the closures given to `with` and `with_mut` (keep
   them short), and for the read of an object not in RAM (about 85 µs per 256-byte page of SPI NOR at
   25 MHz). The writes of a flush run outside of it.
-* **Priorities.** While a flush has the flash, `try_with` and `try_with_mut` return `None` for an object
-  that is not in RAM or is being written; objects in RAM keep working. `with` and `with_mut` wait instead,
-  which on a single core never ends if they preempted the flush. So call `with`, `with_mut` and `flush`
-  from one priority level only. Every other function never waits: call it from anywhere.
+* **Busy flash.** While a flush has the flash, objects in RAM keep working; `with` and `with_mut` return
+  `Busy` for the others. A task at the flush's priority or below never sees it: it can't run during the
+  flush.
 * **RAM budget.** Each object in RAM counts its size plus its serialized size, an estimate of what it owns
   on the heap. Over budget, the least recently used unchanged objects are dropped: they are read again
   when needed. Changed objects stay until a flush; when one more would not fit, the call calls `on_full`

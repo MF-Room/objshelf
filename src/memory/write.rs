@@ -1,6 +1,6 @@
 //! `flush`, the only code that writes to the backend. Each write takes the backend out of the
-//! core inside the lock, waiting while another write has it, writes outside of the lock, and puts
-//! the backend back inside it.
+//! core inside the lock (`Busy` if another flush has it), writes outside of the lock, and puts the
+//! backend back inside it.
 
 use alloc::vec::Vec;
 use core::mem;
@@ -34,14 +34,14 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
     /// Writes the object `id` back if it is modified. It is out of the cache meanwhile, so
     /// nothing changes it during the write. If it was removed meanwhile, it is then dropped.
     fn write_back(&mut self, id: ObjectId) -> Result<(), Error<B::Error>> {
-        let taken = self.wait(|core| {
+        let taken = self.lock(|core| {
             if !core.cache.get(&id).is_some_and(|entry| entry.modified) {
-                return Some(None);
+                return Ok(None);
             }
-            let backend = core.backend.take()?;
+            let backend = core.backend.take().ok_or(Error::Busy)?;
             let entry = core.cache.remove(&id).expect("modified, so cached");
-            Some(Some((backend, entry)))
-        });
+            Ok(Some((backend, entry)))
+        })?;
         let Some((mut backend, mut entry)) = taken else {
             return Ok(());
         };
@@ -68,15 +68,15 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
     /// Writes the directory if it changed, then removes the removed objects that the backend
     /// holds.
     fn write_names(&mut self) -> Result<(), Error<B::Error>> {
-        let taken = self.wait(|core| {
+        let taken = self.lock(|core| {
             if !core.directory_modified {
-                return Some(None);
+                return Ok(None);
             }
-            let backend = core.backend.take()?;
+            let backend = core.backend.take().ok_or(Error::Busy)?;
             core.directory_modified = false;
             let removed = mem::take(&mut core.removed);
-            Some(Some((backend, core.stored_directory(), removed)))
-        });
+            Ok(Some((backend, core.stored_directory(), removed)))
+        })?;
         let Some((mut backend, directory, removed)) = taken else {
             return Ok(());
         };

@@ -1,5 +1,5 @@
-//! Cached objects: their use by the `with*` and `try_*` functions, reads of the ones not in RAM,
-//! and the drop of unmodified ones over the budget. Nothing here writes.
+//! Cached objects: their use by `with` and `with_mut`, reads of the ones not in RAM, and the drop
+//! of unmodified ones over the budget. Nothing here writes.
 
 use alloc::boxed::Box;
 use core::any::Any;
@@ -22,59 +22,42 @@ pub(super) struct Entry<B: Backend> {
 }
 
 impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
-    /// Runs `f` on the object `id`, waiting while a flush has the backend if the object is not in
-    /// RAM. With `modify`, the object is then modified.
+    /// Runs `f` on the object `id`. With `modify`, the object is then modified.
     pub(crate) fn with<T: Storable, R>(
         &mut self,
         id: ObjectId,
         modify: bool,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, Error<B::Error>> {
-        let mut f = Some(f);
-        self.wait(|core| core.access(id, modify, &mut f))
-    }
-
-    /// Like `with`, but `None` instead of waiting.
-    pub(crate) fn try_with<T: Storable, R>(
-        &mut self,
-        id: ObjectId,
-        modify: bool,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<Option<R>, Error<B::Error>> {
-        let mut f = Some(f);
-        self.lock(|core| core.access(id, modify, &mut f))
-            .transpose()
+        self.lock(|core| core.access(id, modify, f))
     }
 }
 
 impl<B: Backend> Core<B> {
-    /// Runs `f` on the object `id`, read from the backend first if it is not in RAM. `None` if
-    /// that needs the backend and a flush has it. With `modify`, the object is then modified, or
-    /// `Full` without running `f` if it does not fit with the other modified objects. Unmodified
-    /// objects over the budget are dropped, the one just used left out.
+    /// Runs `f` on the object `id`, read from the backend first if it is not in RAM: `Busy` if
+    /// a flush has the backend. With `modify`, the object is then modified, or `Full` without
+    /// running `f` if it does not fit with the other modified objects. Unmodified objects over
+    /// the budget are dropped, the one just used left out.
     fn access<T: Storable, R>(
         &mut self,
         id: ObjectId,
         modify: bool,
-        f: &mut Option<impl FnOnce(&mut T) -> R>,
-    ) -> Option<Result<R, Error<B::Error>>> {
-        if let Err(error) = self.load::<T>(id)? {
-            return Some(Err(error));
-        }
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, Error<B::Error>> {
+        self.load::<T>(id)?;
         let entry = &self.cache[&id];
         let value: &dyn Any = &*entry.value;
         if !value.is::<T>() {
-            return Some(Err(Error::WrongType));
+            return Err(Error::WrongType);
         }
         if modify && !entry.modified && !self.fits_modified(entry.size) {
-            return Some(Err(self.full()));
+            return Err(self.full());
         }
         let tick = self.next_tick();
         let entry = self.cache.get_mut(&id).expect("loaded");
         entry.last_use = tick;
         let value: &mut dyn Any = &mut *entry.value;
         let value = value.downcast_mut::<T>().expect("checked above");
-        let f = f.take().expect("runs once");
         let result = f(value);
         if modify {
             let size = object::size(value);
@@ -87,26 +70,22 @@ impl<B: Backend> Core<B> {
             entry.modified = true;
         }
         self.drop_clean(id);
-        Some(Ok(result))
+        Ok(result)
     }
 
-    /// Makes sure the object `id` is in RAM, reading it inside the lock if needed. `None` if
+    /// Makes sure the object `id` is in RAM, reading it inside the lock if needed. `Busy` if
     /// that needs the backend and a flush has it, the write of this object included.
-    fn load<T: Storable>(&mut self, id: ObjectId) -> Option<Result<(), Error<B::Error>>> {
+    fn load<T: Storable>(&mut self, id: ObjectId) -> Result<(), Error<B::Error>> {
         if self.cache.contains_key(&id) {
-            return Some(Ok(()));
+            return Ok(());
         }
         if !self.is_named(id) {
-            return Some(Err(Error::NotFound));
+            return Err(Error::NotFound);
         }
-        let backend = self.backend.as_mut()?;
-        Some(match backend.read::<T>(id) {
-            Ok(value) => {
-                self.cache(id, value, false);
-                Ok(())
-            }
-            Err(error) => Err(Error::Backend(error)),
-        })
+        let backend = self.backend.as_mut().ok_or(Error::Busy)?;
+        let value = backend.read::<T>(id).map_err(Error::Backend)?;
+        self.cache(id, value, false);
+        Ok(())
     }
 
     /// Caches `value` as the object `id`: `modified` if the backend does not hold it.
