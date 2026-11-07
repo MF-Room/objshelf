@@ -15,10 +15,8 @@
 //!   internal ECC (`WRITE_SIZE > 1`) are not supported.
 //! - **Region**: aligned to `ERASE_SIZE`, at least 2 sectors (one is kept free for garbage
 //!   collection), at most 65536 pages (16 MiB), used by nothing else.
-//! - **Blocking**: each flash operation runs to completion when the driver is called, so the
-//!   backend's futures complete on their first poll (the backend is written with the async flash
-//!   traits, behind an adapter, for an async driver later). Storage futures must not be cancelled:
-//!   a dropped write leaves the RAM index out of sync with the flash until the next mount.
+//! - **Blocking**: each flash operation runs to completion when the driver is called, and so does
+//!   each backend operation.
 //! - **Values**: `Serialize` / `DeserializeOwned` (postcard).
 //!
 //! # Guarantees
@@ -62,7 +60,6 @@
 //! 511 × 15 × 235 B ≈ 1.72 MiB of live data. An update also needs room for its new version before
 //! the old one is released.
 
-mod blocking;
 mod layout;
 #[cfg(test)]
 pub(crate) mod mock;
@@ -75,14 +72,11 @@ use core::cmp::Reverse;
 use core::ops::Range;
 
 use embedded_storage::nor_flash::NorFlash;
-// The backend uses the flash through these, on `Blocking`.
-use embedded_storage_async::nor_flash::{NorFlash as _, ReadNorFlash as _};
 use hashbrown::HashMap;
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{Backend, Usage};
 use crate::ObjectId;
-use blocking::Blocking;
 use layout::{
     MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE, PageHeader, SectorHeader, is_blank, is_obsolete,
 };
@@ -140,7 +134,7 @@ struct Candidate {
 
 /// Object store on any NOR flash with 1-byte writes.
 pub struct NorBackend<F: NorFlash> {
-    flash: Blocking<F>,
+    flash: F,
     start: u32,
     sectors: Vec<Sector>,
     objects: HashMap<ObjectId, Object>,
@@ -201,46 +195,43 @@ impl<F: NorFlash> NorBackend<F> {
 
     #[cfg(test)]
     pub(crate) fn flash_mut(&mut self) -> &mut F {
-        &mut self.flash.0
+        &mut self.flash
     }
 
     /// The flash driver, to mount the same flash again as after a reboot.
     #[cfg(test)]
     pub(crate) fn into_flash(self) -> F {
-        self.flash.0
+        self.flash
     }
 
-    async fn read_page(&mut self, page: usize) -> Result<[u8; PAGE_SIZE], NorError<F::Error>> {
+    fn read_page(&mut self, page: usize) -> Result<[u8; PAGE_SIZE], NorError<F::Error>> {
         let mut bytes = [0; PAGE_SIZE];
         let addr = self.page_addr(page);
-        self.flash
-            .read(addr, &mut bytes)
-            .await
-            .map_err(NorError::Flash)?;
+        self.flash.read(addr, &mut bytes).map_err(NorError::Flash)?;
         Ok(bytes)
     }
 
-    async fn program(&mut self, addr: u32, bytes: &[u8]) -> Result<(), NorError<F::Error>> {
-        self.flash.write(addr, bytes).await.map_err(NorError::Flash)
+    fn program(&mut self, addr: u32, bytes: &[u8]) -> Result<(), NorError<F::Error>> {
+        self.flash.write(addr, bytes).map_err(NorError::Flash)
     }
 
-    async fn mark_obsolete(&mut self, page: usize) -> Result<(), NorError<F::Error>> {
+    fn mark_obsolete(&mut self, page: usize) -> Result<(), NorError<F::Error>> {
         let addr = self.page_addr(page) + MARKER_OFFSET as u32;
-        self.program(addr, &[0]).await
+        self.program(addr, &[0])
     }
 
     /// Marks the pages of a replaced or removed version obsolete.
-    async fn release(&mut self, pages: &[u16]) -> Result<(), NorError<F::Error>> {
+    fn release(&mut self, pages: &[u16]) -> Result<(), NorError<F::Error>> {
         for &page in pages {
             let page = usize::from(page);
             self.sectors[Self::sector_of(page)].live -= 1;
-            self.mark_obsolete(page).await?;
+            self.mark_obsolete(page)?;
         }
         Ok(())
     }
 
     /// Erases a sector and writes its header.
-    async fn erase_sector(&mut self, sector: usize) -> Result<(), NorError<F::Error>> {
+    fn erase_sector(&mut self, sector: usize) -> Result<(), NorError<F::Error>> {
         let addr = self.sector_addr(sector);
         let erase_count = self.sectors[sector].erase_count.saturating_add(1);
         self.sectors[sector] = Sector {
@@ -251,22 +242,20 @@ impl<F: NorFlash> NorBackend<F> {
         };
         self.flash
             .erase(addr, addr + F::ERASE_SIZE as u32)
-            .await
             .map_err(NorError::Flash)?;
-        self.program(addr, &SectorHeader::encode(erase_count))
-            .await?;
+        self.program(addr, &SectorHeader::encode(erase_count))?;
         self.sectors[sector].formatted = true;
         Ok(())
     }
 
     /// Makes the least worn free sector the active one.
-    async fn open_sector(&mut self) -> Result<usize, NorError<F::Error>> {
+    fn open_sector(&mut self) -> Result<usize, NorError<F::Error>> {
         let sector = (0..self.sectors.len())
             .filter(|&s| self.is_free(s))
             .min_by_key(|&s| self.sectors[s].erase_count)
             .ok_or(NorError::NoSpace)?;
         if !self.sectors[sector].formatted {
-            self.erase_sector(sector).await?;
+            self.erase_sector(sector)?;
         }
         self.active = Some(sector);
         Ok(sector)
@@ -274,24 +263,24 @@ impl<F: NorFlash> NorBackend<F> {
 
     /// Returns a fully erased page. Pages are allocated in order inside a sector and never
     /// reused before the sector is erased.
-    async fn alloc_page(&mut self) -> Result<usize, NorError<F::Error>> {
+    fn alloc_page(&mut self) -> Result<usize, NorError<F::Error>> {
         loop {
             let sector = match self.active {
                 Some(s) if self.sectors[s].next_page < Self::PAGES_PER_SECTOR => s,
-                _ => self.open_sector().await?,
+                _ => self.open_sector()?,
             };
             let page = sector * Self::PAGES_PER_SECTOR + self.sectors[sector].next_page;
             self.sectors[sector].next_page += 1;
             // A write cut by a power loss can leave a page partly programmed: skip it.
-            if is_blank(&self.read_page(page).await?) {
+            if is_blank(&self.read_page(page)?) {
                 return Ok(page);
             }
         }
     }
 
-    async fn ensure_space(&mut self, pages: usize) -> Result<(), NorError<F::Error>> {
+    fn ensure_space(&mut self, pages: usize) -> Result<(), NorError<F::Error>> {
         while self.user_free_pages() < pages {
-            if !self.collect().await? {
+            if !self.collect()? {
                 return Err(NorError::NoSpace);
             }
         }
@@ -300,7 +289,7 @@ impl<F: NorFlash> NorBackend<F> {
 
     /// Reclaims the sector with the most garbage, the least worn one on a tie. Returns `false` if
     /// no sector can be reclaimed.
-    async fn collect(&mut self) -> Result<bool, NorError<F::Error>> {
+    fn collect(&mut self) -> Result<bool, NorError<F::Error>> {
         let Some(victim) = (0..self.sectors.len())
             .filter(|&s| self.sectors[s].formatted && self.garbage(s) > 0)
             .max_by_key(|&s| (self.garbage(s), Reverse(self.sectors[s].erase_count)))
@@ -321,7 +310,7 @@ impl<F: NorFlash> NorBackend<F> {
 
         for index in 1..self.sectors[victim].next_page {
             let page = victim * Self::PAGES_PER_SECTOR + index;
-            let bytes = self.read_page(page).await?;
+            let bytes = self.read_page(page)?;
             let Some(header) = PageHeader::decode(&bytes) else {
                 continue;
             };
@@ -337,9 +326,9 @@ impl<F: NorFlash> NorBackend<F> {
             }
             // Same bytes, header included: until the victim is erased, mount sees two identical
             // copies and keeps one.
-            let new = self.alloc_page().await?;
+            let new = self.alloc_page()?;
             let addr = self.page_addr(new);
-            self.program(addr, &bytes[..MARKER_OFFSET]).await?;
+            self.program(addr, &bytes[..MARKER_OFFSET])?;
             if let Some(object) = self.objects.get_mut(&id) {
                 object.pages[slot] = new as u16;
             }
@@ -348,14 +337,14 @@ impl<F: NorFlash> NorBackend<F> {
 
         // Retire the sector before erasing it, so a cut erase is detected at mount.
         let addr = self.sector_addr(victim) + MARKER_OFFSET as u32;
-        self.program(addr, &[0]).await?;
-        self.erase_sector(victim).await?;
+        self.program(addr, &[0])?;
+        self.erase_sector(victim)?;
         Ok(true)
     }
 
     /// Rebuilds the RAM state from flash and marks every stale page obsolete, so that each
     /// object has a single version left on flash.
-    async fn scan(&mut self) -> Result<(), NorError<F::Error>> {
+    fn scan(&mut self) -> Result<(), NorError<F::Error>> {
         let mut found: HashMap<ObjectId, Vec<Candidate>> = HashMap::new();
         let mut stale = Vec::new();
         let mut max_version = None;
@@ -363,7 +352,7 @@ impl<F: NorFlash> NorBackend<F> {
         let mut newest = vec![None; self.sectors.len()];
 
         for (sector, newest) in newest.iter_mut().enumerate() {
-            let bytes = self.read_page(sector * Self::PAGES_PER_SECTOR).await?;
+            let bytes = self.read_page(sector * Self::PAGES_PER_SECTOR)?;
             let Some(header) = SectorHeader::decode(&bytes) else {
                 continue;
             };
@@ -375,7 +364,7 @@ impl<F: NorFlash> NorBackend<F> {
 
             for index in 1..Self::PAGES_PER_SECTOR {
                 let page = sector * Self::PAGES_PER_SECTOR + index;
-                let bytes = self.read_page(page).await?;
+                let bytes = self.read_page(page)?;
                 if is_blank(&bytes) {
                     continue;
                 }
@@ -433,7 +422,7 @@ impl<F: NorFlash> NorBackend<F> {
             }
         }
         for page in stale {
-            self.mark_obsolete(page).await?;
+            self.mark_obsolete(page)?;
         }
 
         // Keep allocating where the last write happened; close the other partly used sectors.
@@ -457,7 +446,7 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
     type Error = NorError<F::Error>;
     type Config = NorConfig<F>;
 
-    async fn mount(config: Self::Config) -> Result<Self, Self::Error> {
+    fn mount(config: Self::Config) -> Result<Self, Self::Error> {
         let NorConfig { flash, range } = config;
         let erase_size = F::ERASE_SIZE as u32;
         let geometry_ok = F::WRITE_SIZE == 1
@@ -484,22 +473,22 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
             live: 0,
         };
         let mut backend = Self {
-            flash: Blocking(flash),
+            flash,
             start: range.start,
             sectors: vec![unformatted; sectors],
             objects: HashMap::new(),
             active: None,
             next_version: 0,
         };
-        backend.scan().await?;
+        backend.scan()?;
         Ok(backend)
     }
 
-    async fn write<T: Serialize>(&mut self, id: ObjectId, value: &T) -> Result<(), Self::Error> {
+    fn write<T: Serialize>(&mut self, id: ObjectId, value: &T) -> Result<(), Self::Error> {
         let data = postcard::to_allocvec(value).map_err(NorError::Serialization)?;
         let count = data.len().div_ceil(PAYLOAD_SIZE).max(1);
         let header_count = u16::try_from(count).map_err(|_| NorError::NoSpace)?;
-        self.ensure_space(count).await?;
+        self.ensure_space(count)?;
 
         let version = self.next_version;
         self.next_version += 1;
@@ -514,9 +503,9 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
                 count: header_count,
                 len: chunk.len() as u16,
             };
-            let page = self.alloc_page().await?;
+            let page = self.alloc_page()?;
             let addr = self.page_addr(page);
-            self.program(addr, &header.encode(chunk)).await?;
+            self.program(addr, &header.encode(chunk))?;
             pages.push(page as u16);
         }
 
@@ -525,19 +514,19 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
             self.sectors[Self::sector_of(usize::from(page))].live += 1;
         }
         if let Some(old) = self.objects.insert(id, Object { version, pages }) {
-            self.release(&old.pages).await?;
+            self.release(&old.pages)?;
         }
         Ok(())
     }
 
-    async fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, Self::Error> {
+    fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, Self::Error> {
         let object = self.objects.get(&id).ok_or(NorError::NotFound)?;
         let version = object.version;
         let pages = object.pages.clone();
 
         let mut data = Vec::with_capacity(pages.len() * PAYLOAD_SIZE);
         for (index, &page) in pages.iter().enumerate() {
-            let bytes = self.read_page(usize::from(page)).await?;
+            let bytes = self.read_page(usize::from(page))?;
             let header = PageHeader::decode(&bytes).ok_or(NorError::Corrupt)?;
             if header.object_id != id.0
                 || header.version != version
@@ -550,9 +539,9 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
         postcard::from_bytes(&data).map_err(NorError::Serialization)
     }
 
-    async fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error> {
+    fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error> {
         let object = self.objects.remove(&id).ok_or(NorError::NotFound)?;
-        self.release(&object.pages).await
+        self.release(&object.pages)
     }
 
     /// In whole pages of 235 payload bytes. `capacity` leaves out the sector headers and the

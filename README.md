@@ -12,7 +12,7 @@ You need:
   `rtic::Mutex`);
 * a backend. The NOR backend runs on any blocking `embedded_storage::nor_flash::NorFlash` driver with
   `READ_SIZE` and `WRITE_SIZE` of 1 and an `ERASE_SIZE` that is a multiple of 256: an SPI NOR driver,
-  internal MCU flash, or a RAM simulation for tests. An async driver is not supported yet.
+  internal MCU flash, or a RAM simulation for tests.
 
 ```toml
 [dependencies]
@@ -130,8 +130,7 @@ Details: `TierMem` documentation in [`src/api.rs`](src/api.rs), the public API; 
 ## NOR flash backend
 
 `src/backend/nor`: object store on any blocking `embedded_storage::nor_flash::NorFlash` with 1-byte writes
-(chips with internal ECC are not supported for now). It is written with the async flash traits, behind an
-adapter, so that an async driver can be added later.
+(chips with internal ECC are not supported for now). Every operation blocks until done.
 
 * Objects are serialized with postcard and split in 256-byte pages (20-byte header, 235-byte payload,
   1-byte obsolete marker). Page 0 of each sector holds a sector header with its erase count.
@@ -159,8 +158,7 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [ ] Format version in the sector header, migration of the on-flash format
 - [ ] Mount time: it reads the whole region. Bound it, or persist a checkpoint of the index
 - [ ] Edge cases:
-  - after a flash error, or a dropped (cancelled) future, the RAM state may not match the flash: define
-    the rule (remount?) and document that storage futures must not be cancelled
+  - after a flash error, the RAM state may not match the flash: define the rule (remount?)
   - a page that decays after its write (weak bits after a cut, bit rot) only shows up as `Corrupt` on
     read: the previous version is already marked obsolete, so there is no fallback; optional read-back
     verify after writing
@@ -174,8 +172,8 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [ ] Protection policy at mount: clear or fail
 - [x] Implement `TierMem` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, directory
   object (id 0), LRU read cache with a RAM budget, changes kept in RAM until a flush
-- [ ] Async flash driver: flushes that let other tasks of the same priority run while the flash programs or
-  erases, instead of holding the CPU
+- [ ] Async flush with an async flash driver: let other tasks of the same priority run, or the CPU sleep,
+  while the flash programs or erases, instead of polling it
 - [ ] RAM accounting: the size of an object in RAM is estimated from its serialized size (spare `Vec`
   capacity is not counted)
 - [ ] The directory is a single point of failure: if it is lost (corrupted sector header), mount removes

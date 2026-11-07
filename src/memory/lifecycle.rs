@@ -4,7 +4,6 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use embassy_futures::block_on;
 use hashbrown::{HashMap, HashSet};
 
 use super::Core;
@@ -15,7 +14,7 @@ use crate::{Error, ObjectId};
 pub(super) const DIRECTORY: ObjectId = ObjectId(0);
 
 /// The name directory, as stored in object `DIRECTORY`.
-type Directory = Vec<(String, ObjectId)>;
+pub(super) type Directory = Vec<(String, ObjectId)>;
 
 impl<B: Backend> Core<B> {
     /// Mounts the backend with `config`, blocking until done, and reads the directory.
@@ -24,7 +23,7 @@ impl<B: Backend> Core<B> {
         cache_bytes: usize,
         on_full: fn(),
     ) -> Result<Self, Error<B::Error>> {
-        let (backend, directory) = block_on(mount_backend::<B>(config)).map_err(Error::Backend)?;
+        let (backend, directory) = mount_backend::<B>(config).map_err(Error::Backend)?;
         let next_id = directory.values().map(|id| id.0 + 1).max().unwrap_or(1);
         Ok(Self {
             usage: backend.usage(),
@@ -45,7 +44,7 @@ impl<B: Backend> Core<B> {
     /// Unmounts the backend. The changes in RAM are dropped: flush them first.
     pub(crate) fn unmount(self) -> Result<(), Error<B::Error>> {
         let backend = self.backend.expect("no write runs: the memory is owned");
-        block_on(backend.unmount()).map_err(Error::Backend)
+        backend.unmount().map_err(Error::Backend)
     }
 
     /// The directory to store as object `DIRECTORY`.
@@ -62,13 +61,13 @@ fn stored(directory: &BTreeMap<String, ObjectId>) -> Directory {
 /// Mounts the backend and reads the directory. Names of objects the backend does not hold are
 /// dropped, and the objects without a name, left by an `insert` or a `remove` cut by a reset,
 /// are removed.
-async fn mount_backend<B: Backend>(
+fn mount_backend<B: Backend>(
     config: B::Config,
 ) -> Result<(B, BTreeMap<String, ObjectId>), B::Error> {
-    let mut backend = B::mount(config).await?;
+    let mut backend = B::mount(config)?;
     let ids: HashSet<ObjectId> = backend.ids().into_iter().collect();
     let names: Directory = if ids.contains(&DIRECTORY) {
-        backend.read(DIRECTORY).await?
+        backend.read(DIRECTORY)?
     } else {
         Directory::new()
     };
@@ -79,12 +78,12 @@ async fn mount_backend<B: Backend>(
         .collect();
     if directory.len() != names.len() {
         // Objects lost by the backend (a corrupted sector): store the directory without them.
-        backend.write(DIRECTORY, &stored(&directory)).await?;
+        backend.write(DIRECTORY, &stored(&directory))?;
     }
     let named: HashSet<ObjectId> = directory.values().copied().collect();
     for id in ids {
         if id != DIRECTORY && !named.contains(&id) {
-            backend.remove(id).await?;
+            backend.remove(id)?;
         }
     }
     Ok((backend, directory))

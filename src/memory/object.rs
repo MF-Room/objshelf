@@ -3,8 +3,6 @@
 use core::any::Any;
 use core::mem;
 
-use embassy_futures::block_on;
-
 use crate::backend::Backend;
 use crate::{ObjectId, Storable};
 
@@ -15,7 +13,7 @@ pub(super) trait Cached<B: Backend>: Any + Send {
 
 impl<B: Backend, T: Storable> Cached<B> for T {
     fn write(&self, backend: &mut B, id: ObjectId) -> Result<(), B::Error> {
-        block_on(backend.write(id, self))
+        backend.write(id, self)
     }
 }
 

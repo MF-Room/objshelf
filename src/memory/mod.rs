@@ -18,9 +18,6 @@
 //! - Writes, by `flush` only: the backend and the object to write are taken out of `Core` inside
 //!   the lock, written outside of it, and put back inside the lock. While the backend is out, the
 //!   storage is busy: a `try_*` call that needs it returns `None`, a blocking call waits.
-//!
-//! Backend futures run with `block_on`: the flash driver is blocking, so they complete on their
-//! first poll.
 
 mod cache;
 mod lifecycle;

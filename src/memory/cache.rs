@@ -4,7 +4,6 @@
 use alloc::boxed::Box;
 use core::any::Any;
 
-use embassy_futures::block_on;
 use rtic_core::Mutex;
 
 use super::object::{self, Cached};
@@ -101,7 +100,7 @@ impl<B: Backend> Core<B> {
             return Some(Err(Error::NotFound));
         }
         let backend = self.backend.as_mut()?;
-        Some(match block_on(backend.read::<T>(id)) {
+        Some(match backend.read::<T>(id) {
             Ok(value) => {
                 self.cache(id, value, false);
                 Ok(())

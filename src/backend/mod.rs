@@ -10,15 +10,8 @@ use crate::ObjectId;
 
 /// Persistent store of serialized objects, addressed by `ObjectId`.
 ///
-/// One operation runs at a time (`&mut self`). Storage futures must not be cancelled: a dropped
-/// operation can leave the backend's RAM state out of sync with the storage.
-///
-/// `TierMem` runs each of them to completion with `block_on`, which polls in a loop: for now the
-/// storage driver is blocking, so that each future completes on its first poll. The methods are
-/// async for an async driver later.
-// The futures don't need to be `Send`: they are polled in place. `'static` because
-// `TierMem` erases the types of the objects it caches, which names the backend.
-#[allow(async_fn_in_trait)]
+/// One operation runs at a time (`&mut self`), blocking until done.
+// `'static` because `TierMem` erases the types of the objects it caches, which names the backend.
 pub trait Backend: Sized + 'static {
     /// Errors of the backend and of its storage driver.
     type Error;
@@ -26,16 +19,16 @@ pub trait Backend: Sized + 'static {
     type Config;
 
     /// Opens the storage and rebuilds the backend's state from what it holds.
-    async fn mount(config: Self::Config) -> Result<Self, Self::Error>;
+    fn mount(config: Self::Config) -> Result<Self, Self::Error>;
 
     /// Stores `value` under `id`, replacing any previous value. It is durable when this returns.
-    async fn write<T: Serialize>(&mut self, id: ObjectId, value: &T) -> Result<(), Self::Error>;
+    fn write<T: Serialize>(&mut self, id: ObjectId, value: &T) -> Result<(), Self::Error>;
 
     /// Reads the value stored under `id`. `T` must be the type it was written with.
-    async fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, Self::Error>;
+    fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, Self::Error>;
 
     /// Removes the object `id`. The removal is durable when this returns.
-    async fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error>;
+    fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error>;
 
     /// How the storage space is used. Computed from the backend's RAM state, without I/O.
     fn usage(&self) -> Usage;
@@ -45,7 +38,7 @@ pub trait Backend: Sized + 'static {
     fn ids(&self) -> Vec<ObjectId>;
 
     /// Closes the storage. Nothing needs saving: writes are already durable.
-    async fn unmount(self) -> Result<(), Self::Error> {
+    fn unmount(self) -> Result<(), Self::Error> {
         Ok(())
     }
 }

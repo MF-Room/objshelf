@@ -1,8 +1,5 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::future::Future;
-use core::pin::pin;
-use core::task::{Context, Poll, Waker};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,33 +11,22 @@ use crate::backend::{Backend, Usage};
 /// 1 KiB sectors: a header page and 3 data pages, so garbage collection runs often.
 type SmallFlash = MockFlash<1024>;
 
-/// The mock flash never waits, so polling once is enough.
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    let mut future = pin!(future);
-    let mut cx = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
-            return value;
-        }
-    }
-}
-
 fn mount<const E: usize>(flash: MockFlash<E>) -> NorBackend<MockFlash<E>> {
     let range = 0..flash.data.len() as u32;
-    block_on(NorBackend::mount(NorConfig { flash, range })).unwrap()
+    NorBackend::mount(NorConfig { flash, range }).unwrap()
 }
 
 /// Mounts the same flash again, as after a reboot.
 fn reboot<const E: usize>(backend: NorBackend<MockFlash<E>>) -> NorBackend<MockFlash<E>> {
-    mount(MockFlash::with_data(backend.flash.0.data))
+    mount(MockFlash::with_data(backend.flash.data))
 }
 
 fn write<const E: usize, T: Serialize>(backend: &mut NorBackend<MockFlash<E>>, id: u32, value: &T) {
-    block_on(backend.write(ObjectId(id), value)).unwrap();
+    backend.write(ObjectId(id), value).unwrap();
 }
 
 fn read<const E: usize>(backend: &mut NorBackend<MockFlash<E>>, id: u32) -> Option<Vec<u8>> {
-    match block_on(backend.read(ObjectId(id))) {
+    match backend.read(ObjectId(id)) {
         Ok(value) => Some(value),
         Err(NorError::NotFound) => None,
         Err(error) => panic!("reading object {id}: {error:?}"),
@@ -70,12 +56,9 @@ fn round_trip_and_reboot() {
     write(&mut backend, 3, &());
 
     let mut backend = reboot(backend);
-    assert_eq!(
-        block_on(backend.read::<Pattern>(ObjectId(1))).unwrap(),
-        pattern
-    );
+    assert_eq!(backend.read::<Pattern>(ObjectId(1)).unwrap(), pattern);
     assert_eq!(read(&mut backend, 2), Some(bytes(7, 1000)));
-    block_on(backend.read::<()>(ObjectId(3))).unwrap();
+    backend.read::<()>(ObjectId(3)).unwrap();
     assert_eq!(read(&mut backend, 4), None);
 }
 
@@ -94,10 +77,10 @@ fn update_and_remove() {
     write(&mut backend, 1, &bytes(2, 300));
     assert_eq!(read(&mut backend, 1), Some(bytes(2, 300)));
 
-    block_on(backend.remove(ObjectId(1))).unwrap();
+    backend.remove(ObjectId(1)).unwrap();
     assert_eq!(read(&mut backend, 1), None);
     assert!(matches!(
-        block_on(backend.remove(ObjectId(1))),
+        backend.remove(ObjectId(1)),
         Err(NorError::NotFound)
     ));
 
@@ -149,7 +132,7 @@ fn usage() {
 
     // The old version of object 2 becomes garbage, then object 1 too.
     write(&mut backend, 2, &bytes(3, 10));
-    block_on(backend.remove(ObjectId(1))).unwrap();
+    backend.remove(ObjectId(1)).unwrap();
     let after_remove = Usage {
         used: page,
         free: 5 * page,
@@ -176,17 +159,17 @@ fn usage_adds_up_while_collecting() {
 fn full_then_space_again() {
     let mut backend = mount(SmallFlash::new(3));
     let mut stored = 0;
-    while block_on(backend.write(ObjectId(stored), &bytes(0, 50))).is_ok() {
+    while backend.write(ObjectId(stored), &bytes(0, 50)).is_ok() {
         stored += 1;
     }
     // 3 sectors of 3 data pages, one sector kept for garbage collection.
     assert_eq!(stored, 6);
     assert!(matches!(
-        block_on(backend.write(ObjectId(99), &0u8)),
+        backend.write(ObjectId(99), &0u8),
         Err(NorError::NoSpace)
     ));
 
-    block_on(backend.remove(ObjectId(0))).unwrap();
+    backend.remove(ObjectId(0)).unwrap();
     write(&mut backend, 99, &bytes(1, 50));
     let mut backend = reboot(backend);
     assert_eq!(read(&mut backend, 99), Some(bytes(1, 50)));
@@ -196,10 +179,10 @@ fn full_then_space_again() {
 #[test]
 fn invalid_config() {
     let flash = SmallFlash::new(4);
-    let result = block_on(NorBackend::mount(NorConfig {
+    let result = NorBackend::mount(NorConfig {
         flash,
         range: 512..4096,
-    }));
+    });
     assert!(matches!(result, Err(NorError::InvalidConfig)));
 }
 
@@ -236,21 +219,19 @@ fn apply(state: &mut BTreeMap<u32, Vec<u8>>, op: &Op) {
 fn run(flash: SmallFlash, ops: &[Op]) -> (SmallFlash, Option<usize>) {
     let mut backend = mount(flash);
     for (index, op) in ops.iter().enumerate() {
-        let result = block_on(async {
-            match op {
-                Op::Write(id, value) => backend.write(ObjectId(*id), value).await,
-                Op::Remove(id) => backend.remove(ObjectId(*id)).await,
-            }
-        });
+        let result = match op {
+            Op::Write(id, value) => backend.write(ObjectId(*id), value),
+            Op::Remove(id) => backend.remove(ObjectId(*id)),
+        };
         if let Err(error) = result {
             assert!(
                 matches!(error, NorError::Flash(MockError::PowerCut)),
                 "{error:?}"
             );
-            return (backend.flash.0, Some(index));
+            return (backend.flash, Some(index));
         }
     }
-    (backend.flash.0, None)
+    (backend.flash, None)
 }
 
 fn stored(backend: &mut NorBackend<SmallFlash>) -> BTreeMap<u32, Vec<u8>> {

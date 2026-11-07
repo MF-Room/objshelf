@@ -5,11 +5,10 @@
 use alloc::vec::Vec;
 use core::mem;
 
-use embassy_futures::block_on;
 use rtic_core::Mutex;
 
 use super::Locked;
-use super::lifecycle::DIRECTORY;
+use super::lifecycle::{DIRECTORY, Directory};
 use crate::backend::Backend;
 use crate::{Error, ObjectId, TierMem};
 
@@ -81,14 +80,7 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
         let Some((mut backend, directory, removed)) = taken else {
             return Ok(());
         };
-        let result = block_on(async {
-            backend.write(DIRECTORY, &directory).await?;
-            let stored = backend.ids();
-            for &id in removed.iter().filter(|id| stored.contains(id)) {
-                backend.remove(id).await?;
-            }
-            Ok(())
-        });
+        let result = store_names(&mut backend, &directory, &removed);
         self.lock(|core| {
             core.restore(backend);
             if result.is_err() {
@@ -98,4 +90,18 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
         });
         result.map_err(Error::Backend)
     }
+}
+
+/// Writes `directory`, then removes the objects of `removed` that the backend holds.
+fn store_names<B: Backend>(
+    backend: &mut B,
+    directory: &Directory,
+    removed: &[ObjectId],
+) -> Result<(), B::Error> {
+    backend.write(DIRECTORY, directory)?;
+    let stored = backend.ids();
+    for &id in removed.iter().filter(|id| stored.contains(id)) {
+        backend.remove(id)?;
+    }
+    Ok(())
 }
