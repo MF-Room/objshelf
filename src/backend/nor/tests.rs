@@ -32,7 +32,7 @@ fn mount<const E: usize>(flash: MockFlash<E>) -> NorBackend<MockFlash<E>> {
 
 /// Mounts the same flash again, as after a reboot.
 fn reboot<const E: usize>(backend: NorBackend<MockFlash<E>>) -> NorBackend<MockFlash<E>> {
-    mount(MockFlash::with_data(backend.flash.data))
+    mount(MockFlash::with_data(backend.flash.0.data))
 }
 
 fn write<const E: usize, T: Serialize>(backend: &mut NorBackend<MockFlash<E>>, id: u32, value: &T) {
@@ -247,10 +247,10 @@ fn run(flash: SmallFlash, ops: &[Op]) -> (SmallFlash, Option<usize>) {
                 matches!(error, NorError::Flash(MockError::PowerCut)),
                 "{error:?}"
             );
-            return (backend.flash, Some(index));
+            return (backend.flash.0, Some(index));
         }
     }
-    (backend.flash, None)
+    (backend.flash.0, None)
 }
 
 fn stored(backend: &mut NorBackend<SmallFlash>) -> BTreeMap<u32, Vec<u8>> {

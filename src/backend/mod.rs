@@ -11,9 +11,12 @@ use crate::ObjectId;
 /// Persistent store of serialized objects, addressed by `ObjectId`.
 ///
 /// One operation runs at a time (`&mut self`). Storage futures must not be cancelled: a dropped
-/// operation can leave the backend's RAM state out of sync with the storage. The `TierMem` runner
-/// awaits each of them to completion.
-// The futures don't need to be `Send`: the runner polls them in place. `'static` because
+/// operation can leave the backend's RAM state out of sync with the storage.
+///
+/// `TierMem` runs each of them to completion with `block_on`, which polls in a loop: for now the
+/// storage driver is blocking, so that each future completes on its first poll. The methods are
+/// async for an async driver later.
+// The futures don't need to be `Send`: they are polled in place. `'static` because
 // `TierMem` erases the types of the objects it caches, which names the backend.
 #[allow(async_fn_in_trait)]
 pub trait Backend: Sized + 'static {

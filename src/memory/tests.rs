@@ -1,499 +1,412 @@
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefCell;
-use core::future::{Future, poll_fn};
-use core::pin::pin;
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::{Context, Poll, Waker};
-use std::task::Wake;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
 
-use embassy_futures::join::join;
-use embassy_futures::select::{Either, select};
-use get_size2::GetSize;
+use serde::{Deserialize, Serialize};
 
-use super::{Runner, TierMem};
 use crate::backend::Backend;
-use crate::backend::nor::mock::{Cut, MockError, MockFlash};
+use crate::backend::nor::mock::{Cut, MockFlash};
 use crate::backend::nor::{NorBackend, NorConfig, NorError};
-use crate::{Error, Handle, Mutex, ObjectId, flush, mounted, storable, unmount, with, with_mut};
+use crate::{Error, Handle, Mutex, TierMem, TierMemExt};
 
 type Flash = MockFlash<1024>;
 type Mem = TierMem<NorBackend<Flash>>;
 
 const CACHE: usize = 4096;
 
-/// A lock like RTIC's. The `RefCell` panics if a lock is taken while another is held, as when a
-/// lock is kept across an `.await`.
-#[derive(Clone, Copy)]
-struct Shared<'a>(&'a RefCell<Mem>);
-
-impl Mutex for Shared<'_> {
-    type T = Mem;
-
-    fn lock<R>(&mut self, f: impl FnOnce(&mut Mem) -> R) -> R {
-        f(&mut self.0.borrow_mut())
-    }
-}
-
-struct Flag(AtomicBool);
-
-impl Wake for Flag {
-    fn wake(self: Arc<Self>) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-/// Polls only after a wake-up, like an RTIC executor: a lost wake-up panics instead of hanging.
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    let flag = Arc::new(Flag(AtomicBool::new(true)));
-    let waker = Waker::from(flag.clone());
-    let mut cx = Context::from_waker(&waker);
-    let mut future = pin!(future);
-    for _ in 0..1_000_000 {
-        assert!(
-            flag.0.swap(false, Ordering::SeqCst),
-            "stalled: pending without a wake-up"
-        );
-        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
-            return value;
-        }
-    }
-    panic!("still pending after 1000000 polls");
-}
-
-async fn yield_now() {
-    let mut yielded = false;
-    poll_fn(|cx| {
-        if yielded {
-            return Poll::Ready(());
-        }
-        yielded = true;
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    })
-    .await;
-}
-
-/// Waits until the runner has nothing left to do.
-async fn idle(mem: &mut Shared<'_>) {
-    loop {
-        yield_now().await;
-        if mem.lock(|m| m.runner_waker.is_some()) {
-            return;
-        }
-    }
-}
-
 fn config(flash: Flash) -> NorConfig<Flash> {
     let range = 0..flash.data.len() as u32;
     NorConfig { flash, range }
 }
 
-/// Runs `body` next to the runner, then drops both as on a power cut. Returns the result of
-/// `body` and the flash, to mount it again.
-fn session<R>(
-    flash: Flash,
-    cache_bytes: usize,
-    body: impl AsyncFnOnce(Shared<'_>) -> R,
-) -> (R, Flash) {
-    let cell = RefCell::new(Mem::new(cache_bytes));
-    let mut runner = Runner::new(config(flash));
-    let result = block_on(async {
-        let mut lock = Shared(&cell);
-        match select(runner.run(&mut lock), body(Shared(&cell))).await {
-            Either::First(result) => panic!("the runner stopped: {result:?}"),
-            Either::Second(result) => result,
-        }
+fn mount(flash: Flash, cache_bytes: usize) -> Mem {
+    Mem::mount(config(flash), cache_bytes, || {}).unwrap()
+}
+
+/// Drops the memory as on a power cut, and returns the flash after a reboot.
+fn power_cut(mem: Mem) -> Flash {
+    let backend = mem.core.backend.expect("a write has the backend");
+    Flash::with_data(backend.into_flash().data)
+}
+
+/// A memory shared like an RTIC resource, for the whole program. Its lock panics if it is
+/// already held, as when an "interrupt" runs while a write wrongly holds it.
+#[derive(Clone, Copy)]
+struct Shared(&'static StdMutex<Mem>);
+
+impl Mutex for Shared {
+    type T = Mem;
+
+    fn lock<R>(&mut self, f: impl FnOnce(&mut Mem) -> R) -> R {
+        f(&mut self.0.try_lock().expect("the lock is already held"))
+    }
+}
+
+fn share(mem: Mem) -> Shared {
+    Shared(Box::leak(Box::new(StdMutex::new(mem))))
+}
+
+/// Runs `interrupt` at the start of each program operation of the flash, as an interrupt that
+/// preempts a write.
+fn on_write(mem: Shared, mut interrupt: impl FnMut(&mut Shared) + Send + 'static) {
+    let mut lock = mem;
+    lock.lock(|m| {
+        let flash = m.core.backend.as_mut().unwrap().flash_mut();
+        flash.on_write = Some(Box::new(move || interrupt(&mut { mem })));
     });
-    let flash = runner.into_backend().expect("not mounted").into_flash();
-    (result, flash)
 }
 
-fn reboot(flash: Flash) -> Flash {
-    Flash::with_data(flash.data)
+fn is_cached<T>(mem: &Mem, handle: &Handle<T>) -> bool {
+    mem.core.cache.contains_key(&handle.id)
 }
 
-fn names(mem: &mut Shared<'_>) -> Vec<String> {
-    mem.lock(|m| m.list().unwrap().map(String::from).collect())
-}
-
-#[storable]
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 struct Settings {
     brightness: u8,
     name: String,
 }
 
-#[storable]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Blob(Vec<u8>);
 
-#[test]
-fn insert_flush_reboot_and_load() {
-    let ((), flash) = session(Flash::new(8), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let settings = Settings {
-            brightness: 3,
-            name: "main".to_string(),
-        };
-        let handle = mem.lock(|m| m.insert("settings", settings)).unwrap();
-        with_mut(&mut mem, &handle, |s| s.brightness = 7)
-            .await
-            .unwrap();
-        flush(&mut mem).await.unwrap();
-    });
-
-    session(reboot(flash), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        assert_eq!(names(&mut mem), ["settings"]);
-        let handle: Handle<Settings> = mem.lock(|m| m.get("settings")).unwrap();
-        // Not in RAM after a mount: the first try queues the load.
-        assert_eq!(
-            mem.lock(|m| m.try_with(&handle, |s| s.brightness)).unwrap(),
-            None
-        );
-        let name = with(&mut mem, &handle, |s| s.name.clone()).await.unwrap();
-        assert_eq!(name, "main");
-        assert_eq!(
-            mem.lock(|m| m.try_with(&handle, |s| s.brightness)).unwrap(),
-            Some(7)
-        );
-    });
-}
-
-#[test]
-fn try_with_returns_once_loaded() {
-    let ((), flash) = session(Flash::new(8), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        mem.lock(|m| m.insert("blob", Blob(vec![1, 2, 3]))).unwrap();
-        flush(&mut mem).await.unwrap();
-    });
-
-    session(reboot(flash), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let handle: Handle<Blob> = mem.lock(|m| m.get("blob")).unwrap();
-        let mut tries = 0;
-        loop {
-            tries += 1;
-            let done = mem.lock(|m| m.try_with_mut(&handle, |b| b.0.push(4)));
-            if done.unwrap().is_some() {
-                break;
-            }
-            yield_now().await;
-        }
-        assert!(tries > 1);
-        let blob = with(&mut mem, &handle, Blob::clone).await.unwrap();
-        assert_eq!(blob, Blob(vec![1, 2, 3, 4]));
-    });
-}
-
-#[test]
-fn changes_not_flushed_are_lost_on_reset() {
-    let ((), flash) = session(Flash::new(8), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let handle = mem.lock(|m| m.insert("kept", 1u32)).unwrap();
-        flush(&mut mem).await.unwrap();
-        with_mut(&mut mem, &handle, |v| *v = 2).await.unwrap();
-        mem.lock(|m| m.insert("lost", 3u32)).unwrap();
-    });
-
-    session(reboot(flash), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        assert_eq!(names(&mut mem), ["kept"]);
-        let handle: Handle<u32> = mem.lock(|m| m.get("kept")).unwrap();
-        assert_eq!(with(&mut mem, &handle, |v| *v).await.unwrap(), 1);
-    });
-}
-
-#[test]
-fn get_or_insert_with_inserts_once() {
-    let ((), flash) = session(Flash::new(8), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let first = mem
-            .lock(|m| m.get_or_insert_with("settings", Settings::default))
-            .unwrap();
-        let again = mem
-            .lock(|m| m.get_or_insert_with("settings", || -> Settings { unreachable!() }))
-            .unwrap();
-        assert_eq!(first.id, again.id);
-        flush(&mut mem).await.unwrap();
-    });
-
-    session(reboot(flash), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let handle = mem
-            .lock(|m| m.get_or_insert_with("settings", || -> Settings { unreachable!() }))
-            .unwrap();
-        let settings = with(&mut mem, &handle, Settings::clone).await.unwrap();
-        assert_eq!(settings, Settings::default());
-    });
-}
-
-#[test]
-fn eviction_writes_back_and_reloads() {
-    // Each blob takes 24 + 100 bytes: two fit.
-    let cache = 300;
-    let blob = |i: u8| Blob(vec![i; 100]);
-    let ((), flash) = session(Flash::new(16), cache, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let mut handles = Vec::new();
-        for i in 0..6 {
-            let name = alloc::format!("blob{i}");
-            handles.push(mem.lock(|m| m.insert(&name, blob(i))).unwrap());
-            idle(&mut mem).await;
-            assert!(mem.lock(|m| m.used) <= cache);
-        }
-        for (i, handle) in handles.iter().enumerate() {
-            let read = with(&mut mem, handle, Blob::clone).await.unwrap();
-            assert_eq!(read, blob(i as u8));
-        }
-        idle(&mut mem).await;
-        assert!(mem.lock(|m| m.used) <= cache);
-    });
-
-    // Evicted objects were written with a directory naming them, without a flush.
-    session(reboot(flash), cache, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let names = names(&mut mem);
-        assert!(!names.is_empty());
-        for name in names {
-            let i: u8 = name["blob".len()..].parse().unwrap();
-            let handle: Handle<Blob> = mem.lock(|m| m.get(&name)).unwrap();
-            assert_eq!(with(&mut mem, &handle, Blob::clone).await.unwrap(), blob(i));
-        }
-    });
-}
-
-#[test]
-fn remove_reaches_the_backend_on_flush() {
-    let ((), flash) = session(Flash::new(8), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let a = mem.lock(|m| m.insert("a", 1u32)).unwrap();
-        mem.lock(|m| m.insert("b", 2u32)).unwrap();
-        flush(&mut mem).await.unwrap();
-        // The directory and both objects.
-        assert_eq!(mem.lock(|m| m.usage()).unwrap().objects, 3);
-
-        mem.lock(|m| m.remove(a)).unwrap();
-        assert!(matches!(mem.lock(|m| m.remove(a)), Err(Error::NotFound)));
-        assert!(matches!(
-            with(&mut mem, &a, |v| *v).await,
-            Err(Error::NotFound)
-        ));
-        flush(&mut mem).await.unwrap();
-        assert_eq!(mem.lock(|m| m.usage()).unwrap().objects, 2);
-    });
-
-    session(reboot(flash), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        assert_eq!(names(&mut mem), ["b"]);
-    });
-}
-
-#[test]
-fn remove_before_first_write() {
-    session(Flash::new(8), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let a = mem.lock(|m| m.insert("a", 1u32)).unwrap();
-        mem.lock(|m| m.remove(a)).unwrap();
-        flush(&mut mem).await.unwrap();
-        assert_eq!(names(&mut mem), Vec::<String>::new());
-        // Only the directory, which changed.
-        assert_eq!(mem.lock(|m| m.usage()).unwrap().objects, 1);
-        // The name can be used again.
-        mem.lock(|m| m.insert("a", 2u32)).unwrap();
-    });
-}
-
-#[test]
-fn mount_removes_orphans() {
-    let mut backend = block_on(NorBackend::mount(config(Flash::new(8)))).unwrap();
-    block_on(backend.write(ObjectId(5), &7u32)).unwrap();
-    let flash = reboot(backend.into_flash());
-
-    let ((), flash) = session(flash, CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        assert_eq!(mem.lock(|m| m.usage()).unwrap().objects, 0);
-        // The orphan's id can be reused: nothing is left of it.
-        let handle = mem.lock(|m| m.insert("new", 1u32)).unwrap();
-        flush(&mut mem).await.unwrap();
-        assert_eq!(with(&mut mem, &handle, |v| *v).await.unwrap(), 1);
-    });
-
-    session(reboot(flash), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        let handle: Handle<u32> = mem.lock(|m| m.get("new")).unwrap();
-        assert_eq!(with(&mut mem, &handle, |v| *v).await.unwrap(), 1);
-    });
-}
-
-#[test]
-fn errors() {
-    let mut mem = Mem::new(64);
-    assert!(matches!(mem.get::<u32>("x"), Err(Error::Unavailable)));
-    let missing = Handle::<u32>::new(ObjectId(1));
-    assert!(matches!(
-        mem.try_with(&missing, |v| *v),
-        Err(Error::Unavailable)
-    ));
-
-    session(Flash::new(8), 64, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        assert!(matches!(
-            mem.lock(|m| m.get::<u32>("x")),
-            Err(Error::NotFound)
-        ));
-        assert!(matches!(
-            mem.lock(|m| m.try_with(&missing, |v| *v)),
-            Err(Error::NotFound)
-        ));
-        assert!(matches!(
-            mem.lock(|m| m.insert("big", Blob(vec![0; 100]))),
-            Err(Error::TooLarge)
-        ));
-        mem.lock(|m| m.insert("x", 1u32)).unwrap();
-        assert!(matches!(
-            mem.lock(|m| m.insert("x", 2u32)),
-            Err(Error::AlreadyExists)
-        ));
-        let wrong: Handle<u8> = mem.lock(|m| m.get("x")).unwrap();
-        assert!(matches!(
-            with(&mut mem, &wrong, |v| *v).await,
-            Err(Error::WrongType)
-        ));
-    });
-}
-
-#[test]
-fn flush_returns_backend_errors() {
-    // The first erase, when the first object is written, cuts the power.
-    let flash = Flash::new(8).cut_at(0, Cut::FirstHalf);
-    session(flash, CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        mem.lock(|m| m.insert("a", 1u32)).unwrap();
-        let result = flush(&mut mem).await;
-        assert!(matches!(
-            result,
-            Err(Error::Backend(NorError::Flash(MockError::PowerCut)))
-        ));
-        assert!(!mem.lock(|m| m.is_clean()));
-        assert!(matches!(unmount(&mut mem).await, Err(Error::Backend(_))));
-    });
-}
-
-#[test]
-fn unmount_stops_the_runner() {
-    let cell = RefCell::new(Mem::new(CACHE));
-    let mut runner = Runner::new(config(Flash::new(8)));
-    let (run, result) = block_on(async {
-        let mut lock = Shared(&cell);
-        let mut mem = Shared(&cell);
-        join(runner.run(&mut lock), async {
-            mounted(&mut mem).await?;
-            let handle = mem.lock(|m| m.insert("x", 1u32))?;
-            with_mut(&mut mem, &handle, |v| *v = 2).await?;
-            unmount(&mut mem).await
-        })
-        .await
-    });
-    run.unwrap();
-    result.unwrap();
-    assert!(matches!(
-        cell.borrow().get::<u32>("x"),
-        Err(Error::Unavailable)
-    ));
-    assert!(matches!(
-        block_on(runner.run(&mut Shared(&cell))),
-        Err(Error::Unavailable)
-    ));
-}
-
-#[test]
-fn slow_flash_interleaves_tasks() {
-    let ((), flash) = session(Flash::new(8).pending(3), CACHE, async |mut mem| {
-        mounted(&mut mem).await.unwrap();
-        for i in 0..4u32 {
-            mem.lock(|m| m.insert(&alloc::format!("n{i}"), i)).unwrap();
-        }
-        flush(&mut mem).await.unwrap();
-    });
-
-    session(reboot(flash).pending(3), CACHE, async |mem| {
-        let (mut a, mut b) = (mem, mem);
-        let task_a = async {
-            mounted(&mut a).await.unwrap();
-            for i in 0..4u32 {
-                let handle: Handle<u32> = a.lock(|m| m.get(&alloc::format!("n{i}"))).unwrap();
-                with_mut(&mut a, &handle, |v| *v += 10).await.unwrap();
-            }
-            flush(&mut a).await.unwrap();
-        };
-        let task_b = async {
-            mounted(&mut b).await.unwrap();
-            for i in (0..4u32).rev() {
-                let handle: Handle<u32> = b.lock(|m| m.get(&alloc::format!("n{i}"))).unwrap();
-                let value = with(&mut b, &handle, |v| *v).await.unwrap();
-                assert!(value == i || value == i + 10);
-            }
-        };
-        join(task_a, task_b).await;
-        let mut mem = mem;
-        for i in 0..4u32 {
-            let handle: Handle<u32> = mem.lock(|m| m.get(&alloc::format!("n{i}"))).unwrap();
-            assert_eq!(with(&mut mem, &handle, |v| *v).await.unwrap(), i + 10);
-        }
-    });
-}
-
-fn twice_len(text: &str) -> usize {
-    2 * text.len()
-}
-
-#[storable]
-#[derive(Debug, PartialEq)]
-struct Wrapper<T> {
-    items: Vec<T>,
-    #[storable(ignore)]
-    ignored: String,
-    #[storable(heap_size = 10)]
-    fixed: u8,
-    #[storable(heap_size_fn = twice_len)]
-    text: String,
-}
-
-#[storable]
-#[derive(Debug, PartialEq)]
-enum Shape {
-    Empty,
-    Circle(u32),
-    Named { name: String },
-}
-
-#[test]
-fn storable_macro() {
-    let wrapper = Wrapper {
-        items: vec![1u16, 2, 3],
-        ignored: "not counted".to_string(),
-        fixed: 0,
-        text: "abcd".to_string(),
+/// Inserts four flushed 100-byte blobs, which count 125 bytes each: two fit in 300 bytes.
+fn blobs(mem: &mut Mem) -> Vec<Handle<Blob>> {
+    let insert = |i: u8| {
+        let blob = mem.insert(&i.to_string(), Blob(vec![i; 100])).unwrap();
+        mem.flush().unwrap();
+        blob
     };
-    assert_eq!(wrapper.get_heap_size(), 3 * 2 + 10 + 2 * 4);
-    let bytes = postcard::to_allocvec(&wrapper).unwrap();
-    assert_eq!(
-        postcard::from_bytes::<Wrapper<u16>>(&bytes).unwrap(),
-        wrapper
-    );
+    (0..4).map(insert).collect()
+}
 
-    assert_eq!(Shape::Empty.get_heap_size(), 0);
-    assert_eq!(Shape::Circle(3).get_heap_size(), 0);
-    let named = Shape::Named {
+#[test]
+fn the_memory_can_be_an_rtic_resource() {
+    fn resource<T: Send>() {}
+    resource::<Mem>();
+}
+
+#[test]
+fn insert_get_and_access() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let value = Settings {
+        brightness: 3,
+        name: "a".to_string(),
+    };
+    let settings = mem.insert("settings", value).unwrap();
+    assert_eq!(mem.with(&settings, |s| s.brightness).unwrap(), 3);
+    mem.with_mut(&settings, |s| s.brightness = 4).unwrap();
+    assert_eq!(mem.try_with(&settings, |s| s.brightness).unwrap(), Some(4));
+    let pushed = mem.try_with_mut(&settings, |s| s.name.push('b'));
+    assert_eq!(pushed.unwrap(), Some(()));
+    let expected = Settings {
+        brightness: 4,
         name: "ab".to_string(),
     };
-    assert_eq!(named.get_heap_size(), 2);
-    let bytes = postcard::to_allocvec(&named).unwrap();
-    assert_eq!(postcard::from_bytes::<Shape>(&bytes).unwrap(), named);
+    assert_eq!(mem.with(&settings, Settings::clone).unwrap(), expected);
 
-    assert_eq!(Blob(vec![0; 5]).get_heap_size(), 5);
+    let again = mem.insert("settings", Settings::default());
+    assert!(matches!(again, Err(Error::AlreadyExists)));
+    assert!(matches!(mem.get::<Settings>("other"), Err(Error::NotFound)));
+    let found: Handle<Settings> = mem.get("settings").unwrap();
+    assert_eq!(found.id, settings.id);
+
+    // `f` only runs for a new object.
+    let same = mem.get_or_insert_with("settings", || -> Settings { panic!("it exists") });
+    assert_eq!(same.unwrap().id, settings.id);
+    let blob = mem.get_or_insert_with("blob", || Blob(vec![1, 2])).unwrap();
+    assert_eq!(mem.with(&blob, |b| b.0.len()).unwrap(), 2);
+    assert_eq!(mem.list().unwrap(), ["blob", "settings"]);
+}
+
+#[test]
+fn wrong_type() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    mem.insert("settings", Settings::default()).unwrap();
+    let wrong: Handle<Blob> = mem.get("settings").unwrap();
+    assert!(matches!(
+        mem.with(&wrong, |b| b.0.len()),
+        Err(Error::WrongType)
+    ));
+    let tried = mem.try_with(&wrong, |b| b.0.len());
+    assert!(matches!(tried, Err(Error::WrongType)));
+}
+
+#[test]
+fn insert_and_remove_reach_the_flash_on_flush() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    mem.insert("a", Blob(vec![1])).unwrap();
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert!(mem.list().unwrap().is_empty(), "lost without a flush");
+
+    let a = mem.insert("a", Blob(vec![1])).unwrap();
+    mem.insert("b", Blob(vec![2])).unwrap();
+    mem.flush().unwrap();
+    mem.remove(a).unwrap();
+    assert!(matches!(mem.remove(a), Err(Error::NotFound)));
+    assert!(matches!(mem.with(&a, |_| ()), Err(Error::NotFound)));
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(mem.list().unwrap(), ["a", "b"], "lost without a flush");
+
+    let a: Handle<Blob> = mem.get("a").unwrap();
+    mem.remove(a).unwrap();
+    // Never stored: nothing to remove from the flash.
+    let c = mem.insert("c", 3u32).unwrap();
+    mem.remove(c).unwrap();
+    mem.flush().unwrap();
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(mem.list().unwrap(), ["b"]);
+    let b: Handle<Blob> = mem.get("b").unwrap();
+    assert_eq!(mem.with(&b, |b| b.0.clone()).unwrap(), [2]);
+    // The directory and `b`.
+    assert_eq!(mem.usage().unwrap().objects, 2);
+}
+
+#[test]
+fn changes_reach_the_flash_on_flush() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let a = mem.insert("a", 1u32).unwrap();
+    mem.flush().unwrap();
+    mem.with_mut(&a, |a| *a = 2).unwrap();
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(mem.with(&a, |a| *a).unwrap(), 1, "lost without a flush");
+
+    mem.with_mut(&a, |a| *a = 3).unwrap();
+    mem.flush().unwrap();
+    assert!(!mem.core.cache[&a.id].modified);
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(mem.with(&a, |a| *a).unwrap(), 3);
+    mem.unmount().unwrap();
+}
+
+#[test]
+fn unmodified_objects_leave_ram_over_budget() {
+    let budget = 300;
+    let mut mem = mount(Flash::new(16), budget);
+    let blobs = blobs(&mut mem);
+    let stored = |mem: &Mem| mem.core.backend.as_ref().unwrap().usage();
+    let before = stored(&mem);
+    for (i, blob) in (0..).zip(&blobs) {
+        assert_eq!(mem.with(blob, |b| b.0[0]).unwrap(), i);
+        assert!(mem.core.used <= budget);
+    }
+    assert_eq!(stored(&mem), before, "nothing written");
+}
+
+#[test]
+fn full_until_flush() {
+    static FULL: AtomicUsize = AtomicUsize::new(0);
+    let on_full = || {
+        FULL.fetch_add(1, Ordering::Relaxed);
+    };
+    let mut mem = Mem::mount(config(Flash::new(16)), 300, on_full).unwrap();
+    let blobs = blobs(&mut mem);
+    mem.with_mut(&blobs[0], |b| b.0[0] = 10).unwrap();
+    mem.with_mut(&blobs[1], |b| b.0[0] = 11).unwrap();
+
+    // A third modified blob does not fit: nothing changes.
+    let mut ran = false;
+    let full = mem.with_mut(&blobs[2], |_| ran = true);
+    assert!(matches!(full, Err(Error::Full)));
+    assert!(!ran);
+    let full = mem.try_with_mut(&blobs[2], |_| ());
+    assert!(matches!(full, Err(Error::Full)));
+    let full = mem.insert("new", Blob(vec![0; 100]));
+    assert!(matches!(full, Err(Error::Full)));
+    assert!(matches!(mem.get::<Blob>("new"), Err(Error::NotFound)));
+    assert_eq!(FULL.load(Ordering::Relaxed), 3);
+
+    // Reads and the modified objects still work.
+    assert_eq!(mem.with(&blobs[2], |b| b.0[0]).unwrap(), 2);
+    mem.with_mut(&blobs[0], |b| b.0.push(0)).unwrap();
+
+    mem.flush().unwrap();
+    assert_eq!(mem.core.modified_bytes, 0);
+    mem.with_mut(&blobs[2], |b| b.0[0] = 12).unwrap();
+    let mut mem = mount(power_cut(mem), 300);
+    let firsts: Vec<u8> = blobs
+        .iter()
+        .map(|blob| mem.with(blob, |b| b.0[0]).unwrap())
+        .collect();
+    assert_eq!(firsts, [10, 11, 2, 3]);
+}
+
+#[test]
+fn an_object_over_the_budget_stays_readable() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let big = mem.insert("big", Blob(vec![7; 200])).unwrap();
+    mem.flush().unwrap();
+    let mut mem = mount(power_cut(mem), 50);
+    for _ in 0..3 {
+        assert_eq!(mem.with(&big, |b| b.0.len()).unwrap(), 200);
+        assert_eq!(mem.try_with(&big, |b| b.0.len()).unwrap(), Some(200));
+        assert!(is_cached(&mem, &big));
+    }
+    // But it cannot be modified.
+    assert!(matches!(mem.with_mut(&big, |_| ()), Err(Error::Full)));
+}
+
+#[test]
+fn a_failed_flush_keeps_the_changes() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let a = mem.insert("a", 1u32).unwrap();
+    let b = mem.insert("b", 2u32).unwrap();
+    mem.flush().unwrap();
+    mem.with_mut(&a, |a| *a = 10).unwrap();
+    mem.remove(b).unwrap();
+    let flash = mem.core.backend.as_mut().unwrap().flash_mut();
+    flash.power_cut();
+
+    assert!(matches!(mem.flush(), Err(Error::Backend(_))));
+    assert!(mem.core.cache[&a.id].modified);
+    assert_eq!(mem.core.modified_bytes, mem.core.cache[&a.id].size);
+    assert_eq!(mem.with(&a, |a| *a).unwrap(), 10);
+    assert!(mem.core.directory_modified);
+    assert_eq!(mem.core.removed, [b.id]);
+}
+
+#[test]
+fn try_with_reads_an_object_not_in_ram() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let a = mem.insert("a", 5u32).unwrap();
+    mem.flush().unwrap();
+    mem.core.uncache(a.id);
+    assert_eq!(mem.try_with(&a, |a| *a).unwrap(), Some(5));
+    assert!(is_cached(&mem, &a));
+    assert_eq!(mem.try_with_mut(&a, |a| *a += 1).unwrap(), Some(()));
+    assert_eq!(mem.with(&a, |a| *a).unwrap(), 6);
+}
+
+#[test]
+fn try_with_returns_none_only_while_a_write_has_the_storage() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let cached = mem.insert("cached", 1u32).unwrap();
+    let uncached = mem.insert("uncached", 2u32).unwrap();
+    let written = mem.insert("written", 3u32).unwrap();
+    mem.flush().unwrap();
+    mem.core.uncache(uncached.id);
+    mem.with_mut(&written, |w| *w = 30).unwrap();
+    let mut mem = share(mem);
+
+    // A write inside the lock would make the interrupt's lock panic.
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let log = seen.clone();
+    on_write(mem, move |mem| {
+        log.lock().unwrap().push((
+            mem.try_with(&cached, |v| *v).unwrap(),
+            mem.try_with(&uncached, |v| *v).unwrap(),
+            mem.try_with_mut(&written, |v| *v += 1).unwrap(),
+            mem.usage().unwrap().objects,
+        ));
+    });
+    mem.flush().unwrap();
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter().all(|&s| s == (Some(1), None, None, 4)),
+        "{seen:?}"
+    );
+
+    // The storage is free again.
+    assert_eq!(mem.try_with(&uncached, |v| *v).unwrap(), Some(2));
+    assert_eq!(mem.with(&written, |v| *v).unwrap(), 30);
+}
+
+#[test]
+fn flush_ends_while_an_interrupt_keeps_modifying() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let a = mem.insert("a", 0u32).unwrap();
+    let b = mem.insert("b", 0u32).unwrap();
+    mem.flush().unwrap();
+    mem.with_mut(&a, |v| *v = 1).unwrap();
+    mem.with_mut(&b, |v| *v = 1).unwrap();
+    let mut mem = share(mem);
+    on_write(mem, move |mem| {
+        // The object being written is out of RAM: only the other one changes.
+        mem.try_with_mut(&a, |v| *v += 1).unwrap();
+        mem.try_with_mut(&b, |v| *v += 1).unwrap();
+    });
+    mem.flush().unwrap();
+    // The first one written was modified again during the write of the second.
+    let modified = mem.lock(|m| {
+        let modified = m.core.cache.values().filter(|entry| entry.modified);
+        modified.count()
+    });
+    assert_eq!(modified, 1);
+}
+
+#[test]
+fn remove_during_flush() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let a = mem.insert("a", 1u32).unwrap();
+    mem.insert("b", 2u32).unwrap();
+    mem.flush().unwrap();
+    mem.with_mut(&a, |v| *v = 10).unwrap();
+    let mut mem = share(mem);
+    // Removes `a` during its write. `remove` never waits, so it works from an interrupt.
+    on_write(mem, move |mem| {
+        let _ = mem.remove(a);
+    });
+    mem.flush().unwrap();
+    assert_eq!(mem.list().unwrap(), ["b"]);
+    let flash = mem.lock(|m| {
+        assert!(!is_cached(m, &a));
+        assert_eq!(m.core.modified_bytes, 0);
+        let backend = m.core.backend.take().unwrap();
+        Flash::with_data(backend.into_flash().data)
+    });
+    // Its removal was written in the same flush.
+    let mut mem = mount(flash, CACHE);
+    assert_eq!(mem.list().unwrap(), ["b"]);
+    assert_eq!(mem.usage().unwrap().objects, 2);
+}
+
+#[test]
+fn power_cut_during_flush() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    mem.insert("x", 1u32).unwrap();
+    mem.insert("y", 2u32).unwrap();
+    mem.flush().unwrap();
+    let flash = power_cut(mem);
+    for op in 0.. {
+        let cut = Flash::with_data(flash.data.clone()).cut_at(op, Cut::FirstHalf);
+        let mut mem = mount(cut, CACHE);
+        mem.insert("a", 3u32).unwrap();
+        let y: Handle<u32> = mem.get("y").unwrap();
+        mem.remove(y).unwrap();
+        let done = mem.flush().is_ok();
+
+        // Before or after, never in between: the mount removed the objects without a name.
+        let mut mem = mount(power_cut(mem), CACHE);
+        let names = mem.list().unwrap();
+        let (name, value) = if names == ["a", "x"] {
+            ("a", 3)
+        } else {
+            assert_eq!(names, ["x", "y"], "cut at {op}");
+            ("y", 2)
+        };
+        let handle: Handle<u32> = mem.get(name).unwrap();
+        assert_eq!(mem.with(&handle, |v| *v).unwrap(), value, "cut at {op}");
+        assert_eq!(mem.usage().unwrap().objects, 3, "cut at {op}");
+        if done {
+            assert_eq!(names, ["a", "x"]);
+            break;
+        }
+    }
+}
+
+#[test]
+fn mount_returns_backend_errors() {
+    let config = NorConfig {
+        flash: Flash::new(4),
+        range: 512..4096,
+    };
+    let mounted = Mem::mount(config, CACHE, || {});
+    assert!(matches!(
+        mounted,
+        Err(Error::Backend(NorError::InvalidConfig))
+    ));
 }

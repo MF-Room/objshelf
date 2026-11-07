@@ -9,14 +9,16 @@
 //! # Requirements
 //!
 //! - **Heap**: `alloc` and a global allocator (index, page lists, serialized objects).
-//! - **Flash**: `embedded_storage_async::nor_flash::NorFlash` with `WRITE_SIZE == 1` and
+//! - **Flash**: a blocking `embedded_storage::nor_flash::NorFlash` driver with `WRITE_SIZE == 1` and
 //!   `READ_SIZE == 1`, `ERASE_SIZE` a multiple of 256 and at least 512. `MultiwriteNorFlash` is not
 //!   needed: every byte is programmed at most once between erases, and only from `0xFF`. Chips with
 //!   internal ECC (`WRITE_SIZE > 1`) are not supported.
 //! - **Region**: aligned to `ERASE_SIZE`, at least 2 sectors (one is kept free for garbage
 //!   collection), at most 65536 pages (16 MiB), used by nothing else.
-//! - **Async**: an executor. Storage futures must not be cancelled: a dropped write leaves the RAM
-//!   index out of sync with the flash until the next mount.
+//! - **Blocking**: each flash operation runs to completion when the driver is called, so the
+//!   backend's futures complete on their first poll (the backend is written with the async flash
+//!   traits, behind an adapter, for an async driver later). Storage futures must not be cancelled:
+//!   a dropped write leaves the RAM index out of sync with the flash until the next mount.
 //! - **Values**: `Serialize` / `DeserializeOwned` (postcard).
 //!
 //! # Guarantees
@@ -60,6 +62,7 @@
 //! 511 × 15 × 235 B ≈ 1.72 MiB of live data. An update also needs room for its new version before
 //! the old one is released.
 
+mod blocking;
 mod layout;
 #[cfg(test)]
 pub(crate) mod mock;
@@ -71,12 +74,15 @@ use alloc::vec::Vec;
 use core::cmp::Reverse;
 use core::ops::Range;
 
-use embedded_storage_async::nor_flash::NorFlash;
+use embedded_storage::nor_flash::NorFlash;
+// The backend uses the flash through these, on `Blocking`.
+use embedded_storage_async::nor_flash::{NorFlash as _, ReadNorFlash as _};
 use hashbrown::HashMap;
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{Backend, Usage};
 use crate::ObjectId;
+use blocking::Blocking;
 use layout::{
     MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE, PageHeader, SectorHeader, is_blank, is_obsolete,
 };
@@ -134,7 +140,7 @@ struct Candidate {
 
 /// Object store on any NOR flash with 1-byte writes.
 pub struct NorBackend<F: NorFlash> {
-    flash: F,
+    flash: Blocking<F>,
     start: u32,
     sectors: Vec<Sector>,
     objects: HashMap<ObjectId, Object>,
@@ -193,10 +199,15 @@ impl<F: NorFlash> NorBackend<F> {
         self.sectors.iter().map(|s| s.erase_count)
     }
 
+    #[cfg(test)]
+    pub(crate) fn flash_mut(&mut self) -> &mut F {
+        &mut self.flash.0
+    }
+
     /// The flash driver, to mount the same flash again as after a reboot.
     #[cfg(test)]
     pub(crate) fn into_flash(self) -> F {
-        self.flash
+        self.flash.0
     }
 
     async fn read_page(&mut self, page: usize) -> Result<[u8; PAGE_SIZE], NorError<F::Error>> {
@@ -473,7 +484,7 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
             live: 0,
         };
         let mut backend = Self {
-            flash,
+            flash: Blocking(flash),
             start: range.start,
             sectors: vec![unformatted; sectors],
             objects: HashMap::new(),

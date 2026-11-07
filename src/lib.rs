@@ -1,44 +1,34 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-// Lets `#[storable]`, which writes `::tiermem::..` paths, also work inside this crate.
-extern crate self as tiermem;
 
+mod api;
 pub mod backend;
 mod memory;
 
 use core::marker::PhantomData;
 
-use get_size2::GetSize;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub use memory::{Runner, TierMem, flush, mounted, unmount, with, with_mut};
-/// Lock of a resource shared between tasks: RTIC's `Mutex` (re-exported by `rtic` 2), which
-/// the async functions of this crate take.
+pub use api::{TierMem, TierMemExt};
+/// The lock trait of RTIC 2 (`rtic::Mutex`), which [`TierMemExt`] is implemented for. Implement
+/// it to share a `TierMem` without RTIC.
 pub use rtic_core::Mutex;
-pub use tiermem_macros::storable;
-
-/// Paths used by the code `#[storable]` generates. Not public API.
-#[doc(hidden)]
-pub mod __private {
-    pub use get_size2;
-    pub use serde;
-}
 
 /// Identifier of an object stored in a [`backend::Backend`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjectId(u32);
 
-/// Types that can be kept in a [`TierMem`]: serialized when they go to the backend, and sized
-/// with [`GetSize`] to count the RAM they take in the cache. [`storable`] implements all of it.
-pub trait Storable: Serialize + DeserializeOwned + GetSize + Send + 'static {}
+/// Types that can be kept in a [`TierMem`]: serialized when they go to the backend. `Send`, as
+/// RTIC shares resources between tasks of different priorities.
+pub trait Storable: Serialize + DeserializeOwned + Send + 'static {}
 
-impl<T: Serialize + DeserializeOwned + GetSize + Send + 'static> Storable for T {}
+impl<T: Serialize + DeserializeOwned + Send + 'static> Storable for T {}
 
-/// Typed handle to an object of type `T`, obtained from [`TierMem::get`] or [`TierMem::insert`].
+/// Typed handle to an object of type `T`, obtained from [`TierMemExt::get`] or [`TierMemExt::insert`].
 ///
 /// A handle is a plain identifier: copying it is free, and it can be stored anywhere (statics, other
-/// tasks). The object itself is only reached through the `with*` functions.
+/// tasks). The object itself is only reached through the `with*` methods of [`TierMemExt`].
 pub struct Handle<T> {
     pub(crate) id: ObjectId,
     // `fn() -> T`: the handle owns no `T`, so it is `Send` and `Sync` whatever `T` is.
@@ -69,12 +59,11 @@ pub enum Error<E> {
     NotFound,
     /// An object with this name already exists.
     AlreadyExists,
-    /// The object is larger than the whole RAM budget of the cache.
-    TooLarge,
     /// The object is cached with another type than the one of the handle.
     WrongType,
-    /// The memory is not mounted: mount not finished or failed, or unmounted.
-    Unavailable,
+    /// The changes not flushed yet fill the RAM budget: nothing was changed. The callback given to
+    /// [`TierMem::mount`] was called to start a flush; try again once it is done.
+    Full,
     /// The backend failed.
     Backend(E),
 }
