@@ -10,9 +10,12 @@ use core::marker::PhantomData;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub use api::{TierMem, TierMemExt};
-/// The lock trait of RTIC 2 (`rtic::Mutex`), which [`TierMemExt`] is implemented for. Implement
-/// it to share a `TierMem` without RTIC.
+pub use api::{
+    TierMem, flush, get, get_or_insert_with, insert, list, remove, try_with, try_with_mut, usage,
+    with, with_mut,
+};
+/// The lock trait of RTIC 2 (`rtic::Mutex`): the functions of this crate take anything that
+/// implements it. Implement it to share a `TierMem` without RTIC.
 pub use rtic_core::Mutex;
 
 /// Identifier of an object stored in a [`backend::Backend`].
@@ -25,10 +28,10 @@ pub trait Storable: Serialize + DeserializeOwned + Send + 'static {}
 
 impl<T: Serialize + DeserializeOwned + Send + 'static> Storable for T {}
 
-/// Typed handle to an object of type `T`, obtained from [`TierMemExt::get`] or [`TierMemExt::insert`].
+/// Typed handle to an object of type `T`, obtained from [`get`] or [`insert`].
 ///
 /// A handle is a plain identifier: copying it is free, and it can be stored anywhere (statics, other
-/// tasks). The object itself is only reached through the `with*` methods of [`TierMemExt`].
+/// tasks). The object itself is only reached through the `with*` functions, such as [`with`].
 pub struct Handle<T> {
     pub(crate) id: ObjectId,
     // `fn() -> T`: the handle owns no `T`, so it is `Send` and `Sync` whatever `T` is.

@@ -3,7 +3,7 @@
 //! `TierMem` (`Locked`).
 //!
 //! - `object`: cached objects with their type erased.
-//! - `cache`: cached objects, their use by the `with*` and `try_*` methods, and their reads.
+//! - `cache`: cached objects, their use by the `with*` and `try_*` functions, and their reads.
 //! - `names`: the names, `insert` and `remove`.
 //! - `write`: `flush`, the only code that writes to the backend.
 //! - `lifecycle`: mount, with the name directory (object 0), and unmount.

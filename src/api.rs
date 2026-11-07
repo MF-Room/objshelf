@@ -1,5 +1,5 @@
-//! The public API: [`TierMem`], and [`TierMemExt`], its methods on anything that locks one. The
-//! engine behind it is in `memory`.
+//! The public API: [`TierMem`], and the functions that use it through anything that locks one.
+//! The engine behind it is in `memory`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -13,51 +13,51 @@ use crate::{Error, Handle, Storable};
 /// Object memory on top of a storage [`Backend`], shared between RTIC tasks as a `#[shared]`
 /// resource.
 ///
-/// Objects have a name and a type. [`list`](TierMemExt::list) returns the names,
-/// [`get`](TierMemExt::get), [`insert`](TierMemExt::insert) and
-/// [`get_or_insert_with`](TierMemExt::get_or_insert_with) return a typed [`Handle`], and every
-/// access to an object goes through a closure given to one of the `with*` methods, so no reference
-/// to it escapes.
+/// Objects have a name and a type. [`list`] returns the names, [`get`], [`insert`] and
+/// [`get_or_insert_with`] return a typed [`Handle`], and every access to an object goes through a
+/// closure given to one of the `with*` functions, so no reference to it escapes.
 ///
-/// The methods are those of [`TierMemExt`], on RTIC's resource proxy (`cx.shared.mem`). An owned
-/// `TierMem` is its own lock, so they also work on it directly, as in `init` before it is shared.
+/// The functions take the memory as `mem`: anything that locks a `TierMem`, such as RTIC's
+/// resource proxy (`&mut cx.shared.mem`). An owned `TierMem` is its own lock, so they also take
+/// `&mut mem` directly, as in `init` before it is shared.
 ///
 /// ```ignore
-/// use tiermem::TierMemExt;
-///
 /// // in `init`: when the changes fill the RAM budget, the `save` task is spawned to flush them
 /// let config = NorConfig { flash, range };
 /// let mut mem = TierMem::<NorBackend<Flash>>::mount(config, 16 * 1024, || {
 ///     save::spawn().ok();
 /// })?;
-/// let settings: Handle<Settings> = mem.get_or_insert_with("settings", Settings::default)?;
+/// let settings: Handle<Settings> =
+///     tiermem::get_or_insert_with(&mut mem, "settings", Settings::default)?;
 ///
 /// // in a task with `shared = [mem]`
-/// let bpm = cx.shared.mem.with(&settings, |s| s.bpm)?; // reads the object if it is not in RAM
-/// cx.shared.mem.with_mut(&settings, |s| s.bpm = 120)?; // in RAM until the next flush
-/// let bpm = cx.shared.mem.try_with(&settings, |s| s.bpm)?.unwrap_or(bpm); // never waits
-/// if cx.shared.mem.try_with_mut(&settings, |s| s.bpm = 120)?.is_none() { /* try again later */ }
+/// let mem = &mut cx.shared.mem;
+/// let bpm = tiermem::with(mem, &settings, |s| s.bpm)?; // reads the object if it is not in RAM
+/// tiermem::with_mut(mem, &settings, |s| s.bpm = 120)?; // in RAM until the next flush
+/// let bpm = tiermem::try_with(mem, &settings, |s| s.bpm)?.unwrap_or(bpm); // never waits
+/// if tiermem::try_with_mut(mem, &settings, |s| s.bpm = 120)?.is_none() { /* try again later */ }
 ///
 /// // in the `save` task, of the lowest priority
-/// cx.shared.mem.flush()?; // the changes go to the backend
+/// tiermem::flush(&mut cx.shared.mem)?; // the changes go to the backend
 /// ```
 ///
 /// # Writes
 ///
-/// Only [`flush`](TierMemExt::flush) (and [`unmount`](Self::unmount)) writes to the backend.
-/// Changes, [`insert`](TierMemExt::insert) and [`remove`](TierMemExt::remove) included, stay in
-/// RAM until then. A flush runs in the caller's task: a few ms per object, and hundreds of ms when
-/// NOR garbage collection runs (a sector erase is up to 400 ms on the W25Q16JV). Call it from a
-/// task of the lowest priority, so that every other task keeps running meanwhile.
+/// Only [`flush`] (and [`unmount`](Self::unmount)) writes to the backend. Changes, [`insert`] and
+/// [`remove`] included, stay in RAM until then. A flush runs in the caller's task: a few ms per
+/// object, and hundreds of ms when NOR garbage collection runs (a sector erase is up to 400 ms on
+/// the W25Q16JV). Call it from a task of the lowest priority, so that every other task keeps
+/// running meanwhile.
 ///
 /// # Locking
 ///
-/// Each method takes the RTIC lock of the resource for short steps only. Like every RTIC lock, it
-/// blocks the tasks that share the memory and none of the others: tasks of a higher priority that
-/// don't use it, such as a MIDI input interrupt, always keep running. The lock is held for:
+/// Each function takes the lock for short steps only: never wrap a call in `lock` yourself. Like
+/// every RTIC lock, it blocks the tasks that share the memory and none of the others: tasks of a
+/// higher priority that don't use it, such as a MIDI input interrupt, always keep running. The
+/// lock is held for:
 ///
 /// - RAM work: names, changes, and the access to an object in RAM, with the closure given to the
-///   `with*` method (keep closures short);
+///   `with*` function (keep closures short);
 /// - the read of an object that is not in RAM: about 85 µs per 256-byte page on SPI NOR at
 ///   25 MHz.
 ///
@@ -65,17 +65,15 @@ use crate::{Error, Handle, Storable};
 ///
 /// # Busy storage
 ///
-/// Only the methods that read an object not in RAM need the storage. While a flush has it:
+/// Only the functions that read an object not in RAM need the storage. While a flush has it:
 ///
-/// - [`try_with`](TierMemExt::try_with) and [`try_with_mut`](TierMemExt::try_with_mut) return
-///   `Ok(None)` for an object that is not in RAM, or is the one being written (it is out of RAM
-///   during its write). Objects in RAM keep working.
-/// - [`with`](TierMemExt::with) and [`with_mut`](TierMemExt::with_mut) wait. On a single core,
-///   that only happens when they preempt the flush, which cannot finish then: call `with`,
-///   `with_mut` and `flush` from one priority level only (one task, or tasks of the same
-///   priority).
+/// - [`try_with`] and [`try_with_mut`] return `Ok(None)` for an object that is not in RAM, or is
+///   the one being written (it is out of RAM during its write). Objects in RAM keep working.
+/// - [`with`] and [`with_mut`] wait. On a single core, that only happens when they preempt the
+///   flush, which cannot finish then: call `with`, `with_mut` and `flush` from one priority level
+///   only (one task, or tasks of the same priority).
 ///
-/// The other methods never wait: call them from anywhere.
+/// The other functions never wait: call them from anywhere.
 ///
 /// # RAM budget
 ///
@@ -85,17 +83,16 @@ use crate::{Error, Handle, Storable};
 /// - Over budget, the least recently used unmodified objects are dropped, with no I/O: they are
 ///   read again when needed. The object just used stays, even alone over budget.
 /// - Modified objects stay until a flush. When an object would become modified and they would
-///   then take more than `cache_bytes`, [`with_mut`](TierMemExt::with_mut),
-///   [`try_with_mut`](TierMemExt::try_with_mut) and [`insert`](TierMemExt::insert) call the
+///   then take more than `cache_bytes`, [`with_mut`], [`try_with_mut`] and [`insert`] call the
 ///   `on_full` callback given to [`mount`](Self::mount), to start a flush, and return
 ///   [`Error::Full`] without changing anything. An object already modified can still change, and
 ///   grow over the budget.
 ///
 /// # Durability
 ///
-/// Changes reach the backend on [`flush`](TierMemExt::flush) or [`unmount`](Self::unmount): a
-/// reset loses the rest. A power cut during a flush leaves each object either as it was or as
-/// written, and the next mount cleans up the names and objects the flush left half done.
+/// Changes reach the backend on [`flush`] or [`unmount`](Self::unmount): a reset loses the rest.
+/// A power cut during a flush leaves each object either as it was or as written, and the next
+/// mount cleans up the names and objects the flush left half done.
 pub struct TierMem<B: Backend> {
     pub(crate) core: Core<B>,
 }
@@ -118,7 +115,7 @@ impl<B: Backend> TierMem<B> {
 
     /// Flushes, then unmounts the backend.
     pub fn unmount(mut self) -> Result<(), Error<B::Error>> {
-        self.flush()?;
+        flush(&mut self)?;
         self.core.unmount()
     }
 }
@@ -132,179 +129,129 @@ impl<B: Backend> Mutex for TierMem<B> {
     }
 }
 
-/// The methods of a [`TierMem`], on anything that locks one: an RTIC shared resource
-/// (`cx.shared.mem`), or a `TierMem` itself. See [`TierMem`] for the locking, busy storage, RAM
-/// budget and durability.
-pub trait TierMemExt {
-    /// Errors of the backend.
-    type Error;
-
-    /// Names of all the stored objects, in no particular order. Never waits.
-    fn list(&mut self) -> Result<Vec<String>, Error<Self::Error>>;
-
-    /// Handle to the object `name`. Never waits.
-    ///
-    /// `T` must be the type the object was inserted with. Returns [`Error::NotFound`] if there is
-    /// no object with this name.
-    fn get<T: Storable>(&mut self, name: &str) -> Result<Handle<T>, Error<Self::Error>>;
-
-    /// Inserts a new object `name` and returns its handle. Never waits: the object is in RAM,
-    /// and reaches the backend at the next [`flush`](Self::flush).
-    ///
-    /// Returns [`Error::AlreadyExists`] if an object with this name exists, and [`Error::Full`]
-    /// if the changes not flushed yet leave no room for it (see
-    /// [RAM budget](TierMem#ram-budget)).
-    fn insert<T: Storable>(
-        &mut self,
-        name: &str,
-        value: T,
-    ) -> Result<Handle<T>, Error<Self::Error>>;
-
-    /// Handle to the object `name`. If there is no object with this name (as on the first boot),
-    /// inserts the value returned by `f` first; `f` only runs in that case. Never waits.
-    ///
-    /// `T` must be the type the object was inserted with.
-    fn get_or_insert_with<T: Storable>(
-        &mut self,
-        name: &str,
-        f: impl FnOnce() -> T,
-    ) -> Result<Handle<T>, Error<Self::Error>>;
-
-    /// Removes the object of `handle`. Never waits: the removal reaches the backend at the next
-    /// [`flush`](Self::flush).
-    ///
-    /// Returns [`Error::NotFound`] if it is already removed.
-    fn remove<T: Storable>(&mut self, handle: Handle<T>) -> Result<(), Error<Self::Error>>;
-
-    /// Runs `f` on the object of `handle` and returns its result. Reads the object if it is not
-    /// in RAM, waiting if a flush has the storage (see [Busy storage](TierMem#busy-storage)).
-    fn with<T: Storable, R>(
-        &mut self,
-        handle: &Handle<T>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<R, Error<Self::Error>>;
-
-    /// Runs `f` on the object of `handle` with mutable access and returns its result. Reads the
-    /// object if it is not in RAM, waiting if a flush has the storage.
-    ///
-    /// The change is in RAM when this returns, and reaches the backend at the next
-    /// [`flush`](Self::flush). Returns [`Error::Full`] without running `f` if the changes not
-    /// flushed yet leave no room for this object (see [RAM budget](TierMem#ram-budget)).
-    fn with_mut<T: Storable, R>(
-        &mut self,
-        handle: &Handle<T>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, Error<Self::Error>>;
-
-    /// Like [`with`](Self::with), but never waits: returns `Ok(None)` without running `f` if the
-    /// object is not in RAM and a flush has the storage. Reads the object if it is not in RAM and
-    /// the storage is free.
-    ///
-    /// Real errors still come as `Err`, so `?` and the `Option` methods replace a `match`:
-    /// `mem.try_with(&h, |s| s.bpm)?.unwrap_or(last_bpm)`.
-    fn try_with<T: Storable, R>(
-        &mut self,
-        handle: &Handle<T>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<Option<R>, Error<Self::Error>>;
-
-    /// Like [`with_mut`](Self::with_mut), but never waits: returns `Ok(None)` without running `f`
-    /// (so without changing the object) if the object is not in RAM and a flush has the storage.
-    /// Reads the object if it is not in RAM and the storage is free.
-    fn try_with_mut<T: Storable, R>(
-        &mut self,
-        handle: &Handle<T>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<Option<R>, Error<Self::Error>>;
-
-    /// How the backend's space is used (see [`Usage`]), as of the last storage operation. Never
-    /// waits.
-    ///
-    /// The changes not flushed yet are not counted: modified objects count with their stored
-    /// size, and new ones not at all.
-    fn usage(&mut self) -> Result<Usage, Error<Self::Error>>;
-
-    /// Writes the changes to the backend: the modified and new objects, then the names, then the
-    /// removals. Waits if another flush has the storage.
-    ///
-    /// Each object modified when it starts is written once, so it ends even if an interrupt keeps
-    /// modifying objects. It stops at the first error: what is not written stays in RAM for the
-    /// next flush.
-    fn flush(&mut self) -> Result<(), Error<Self::Error>>;
+/// Names of all the stored objects, in no particular order. Never waits.
+pub fn list<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Vec<String> {
+    Locked(mem).list()
 }
 
-impl<B: Backend, M: Mutex<T = TierMem<B>>> TierMemExt for M {
-    type Error = B::Error;
+/// Handle to the object `name`. Never waits.
+///
+/// `T` must be the type the object was inserted with. Returns [`Error::NotFound`] if there is no
+/// object with this name.
+pub fn get<T: Storable, B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+    name: &str,
+) -> Result<Handle<T>, Error<B::Error>> {
+    let id = Locked(mem).get(name).ok_or(Error::NotFound)?;
+    Ok(Handle::new(id))
+}
 
-    fn list(&mut self) -> Result<Vec<String>, Error<B::Error>> {
-        Ok(Locked(self).list())
-    }
+/// Inserts a new object `name` and returns its handle. Never waits: the object is in RAM, and
+/// reaches the backend at the next [`flush`].
+///
+/// Returns [`Error::AlreadyExists`] if an object with this name exists, and [`Error::Full`] if
+/// the changes not flushed yet leave no room for it (see [RAM budget](TierMem#ram-budget)).
+pub fn insert<T: Storable, B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+    name: &str,
+    value: T,
+) -> Result<Handle<T>, Error<B::Error>> {
+    Locked(mem).insert(name, value).map(Handle::new)
+}
 
-    fn get<T: Storable>(&mut self, name: &str) -> Result<Handle<T>, Error<B::Error>> {
-        let id = Locked(self).get(name).ok_or(Error::NotFound)?;
-        Ok(Handle::new(id))
-    }
-
-    fn insert<T: Storable>(&mut self, name: &str, value: T) -> Result<Handle<T>, Error<B::Error>> {
-        Locked(self).insert(name, value).map(Handle::new)
-    }
-
-    fn get_or_insert_with<T: Storable>(
-        &mut self,
-        name: &str,
-        f: impl FnOnce() -> T,
-    ) -> Result<Handle<T>, Error<B::Error>> {
-        match self.get(name) {
-            Err(Error::NotFound) => match self.insert(name, f()) {
-                // Inserted by another task meanwhile.
-                Err(Error::AlreadyExists) => self.get(name),
-                result => result,
-            },
+/// Handle to the object `name`. If there is no object with this name (as on the first boot),
+/// inserts the value returned by `f` first; `f` only runs in that case. Never waits.
+///
+/// `T` must be the type the object was inserted with.
+pub fn get_or_insert_with<T: Storable, B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+    name: &str,
+    f: impl FnOnce() -> T,
+) -> Result<Handle<T>, Error<B::Error>> {
+    match get(mem, name) {
+        Err(Error::NotFound) => match insert(mem, name, f()) {
+            // Inserted by another task meanwhile.
+            Err(Error::AlreadyExists) => get(mem, name),
             result => result,
-        }
+        },
+        result => result,
     }
+}
 
-    fn remove<T: Storable>(&mut self, handle: Handle<T>) -> Result<(), Error<B::Error>> {
-        Locked(self).remove(handle.id)
-    }
+/// Removes the object of `handle`. Never waits: the removal reaches the backend at the next
+/// [`flush`].
+///
+/// Returns [`Error::NotFound`] if it is already removed.
+pub fn remove<T: Storable, B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+    handle: Handle<T>,
+) -> Result<(), Error<B::Error>> {
+    Locked(mem).remove(handle.id)
+}
 
-    fn with<T: Storable, R>(
-        &mut self,
-        handle: &Handle<T>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<R, Error<B::Error>> {
-        Locked(self).with(handle.id, false, |value: &mut T| f(value))
-    }
+/// Runs `f` on the object of `handle` and returns its result. Reads the object if it is not in
+/// RAM, waiting if a flush has the storage (see [Busy storage](TierMem#busy-storage)).
+pub fn with<T: Storable, R, B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+    handle: &Handle<T>,
+    f: impl FnOnce(&T) -> R,
+) -> Result<R, Error<B::Error>> {
+    Locked(mem).with(handle.id, false, |value: &mut T| f(value))
+}
 
-    fn with_mut<T: Storable, R>(
-        &mut self,
-        handle: &Handle<T>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, Error<B::Error>> {
-        Locked(self).with(handle.id, true, f)
-    }
+/// Runs `f` on the object of `handle` with mutable access and returns its result. Reads the
+/// object if it is not in RAM, waiting if a flush has the storage.
+///
+/// The change is in RAM when this returns, and reaches the backend at the next [`flush`].
+/// Returns [`Error::Full`] without running `f` if the changes not flushed yet leave no room for
+/// this object (see [RAM budget](TierMem#ram-budget)).
+pub fn with_mut<T: Storable, R, B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+    handle: &Handle<T>,
+    f: impl FnOnce(&mut T) -> R,
+) -> Result<R, Error<B::Error>> {
+    Locked(mem).with(handle.id, true, f)
+}
 
-    fn try_with<T: Storable, R>(
-        &mut self,
-        handle: &Handle<T>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<Option<R>, Error<B::Error>> {
-        Locked(self).try_with(handle.id, false, |value: &mut T| f(value))
-    }
+/// Like [`with`], but never waits: returns `Ok(None)` without running `f` if the object is not in
+/// RAM and a flush has the storage. Reads the object if it is not in RAM and the storage is free.
+///
+/// Real errors still come as `Err`, so `?` and the `Option` methods replace a `match`:
+/// `tiermem::try_with(mem, &h, |s| s.bpm)?.unwrap_or(last_bpm)`.
+pub fn try_with<T: Storable, R, B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+    handle: &Handle<T>,
+    f: impl FnOnce(&T) -> R,
+) -> Result<Option<R>, Error<B::Error>> {
+    Locked(mem).try_with(handle.id, false, |value: &mut T| f(value))
+}
 
-    fn try_with_mut<T: Storable, R>(
-        &mut self,
-        handle: &Handle<T>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<Option<R>, Error<B::Error>> {
-        Locked(self).try_with(handle.id, true, f)
-    }
+/// Like [`with_mut`], but never waits: returns `Ok(None)` without running `f` (so without
+/// changing the object) if the object is not in RAM and a flush has the storage. Reads the object
+/// if it is not in RAM and the storage is free.
+pub fn try_with_mut<T: Storable, R, B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+    handle: &Handle<T>,
+    f: impl FnOnce(&mut T) -> R,
+) -> Result<Option<R>, Error<B::Error>> {
+    Locked(mem).try_with(handle.id, true, f)
+}
 
-    fn usage(&mut self) -> Result<Usage, Error<B::Error>> {
-        Ok(Locked(self).usage())
-    }
+/// How the backend's space is used (see [`Usage`]), as of the last storage operation. Never
+/// waits.
+///
+/// The changes not flushed yet are not counted: modified objects count with their stored size,
+/// and new ones not at all.
+pub fn usage<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Usage {
+    Locked(mem).usage()
+}
 
-    fn flush(&mut self) -> Result<(), Error<B::Error>> {
-        Locked(self).flush()
-    }
+/// Writes the changes to the backend: the modified and new objects, then the names, then the
+/// removals. Waits if another flush has the storage.
+///
+/// Each object modified when it starts is written once, so it ends even if an interrupt keeps
+/// modifying objects. It stops at the first error: what is not written stays in RAM for the next
+/// flush.
+pub fn flush<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Result<(), Error<B::Error>> {
+    Locked(mem).flush()
 }

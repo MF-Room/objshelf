@@ -1,4 +1,4 @@
-//! Cached objects: their use by the `with*` and `try_*` methods, reads of the ones not in RAM,
+//! Cached objects: their use by the `with*` and `try_*` functions, reads of the ones not in RAM,
 //! and the drop of unmodified ones over the budget. Nothing here writes.
 
 use alloc::boxed::Box;

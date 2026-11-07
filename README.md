@@ -20,13 +20,14 @@ tiermem = { git = "https://github.com/MF-Room/tiermem" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 ```
 
-`TierMem` is an RTIC `#[shared]` resource. Its methods come from the `TierMemExt` trait, implemented for
-RTIC's resource proxy (`cx.shared.mem`) and for an owned `TierMem` (as in `init`, before it is shared):
+`TierMem` is an RTIC `#[shared]` resource. The functions of `tiermem` take it as their first argument,
+through anything that locks it: RTIC's resource proxy (`&mut cx.shared.mem`), or an owned `TierMem` (as in
+`init`, before it is shared). They lock it themselves: never call them inside `lock`.
 
 ```rust
 use serde::{Deserialize, Serialize};
 use tiermem::backend::nor::{NorBackend, NorConfig};
-use tiermem::{Handle, TierMem, TierMemExt};
+use tiermem::{Handle, TierMem};
 
 type Mem = TierMem<NorBackend<Flash>>;
 
@@ -60,7 +61,7 @@ fn init(cx: init::Context) -> (Shared, Local) {
     })
     .unwrap();
     // Finds the object again after a reboot, or creates it the first time.
-    let settings = mem.get_or_insert_with("settings", Settings::default).unwrap();
+    let settings = tiermem::get_or_insert_with(&mut mem, "settings", Settings::default).unwrap();
     ui::spawn().unwrap();
     (Shared { mem }, Local { ui_settings: settings, tick_settings: settings })
 }
@@ -68,11 +69,12 @@ fn init(cx: init::Context) -> (Shared, Local) {
 // `with`, `with_mut` and `flush`: from one priority level only, the lowest.
 #[task(priority = 1, shared = [mem], local = [ui_settings])]
 async fn ui(mut cx: ui::Context) {
-    let settings = *cx.local.ui_settings;
+    let settings = cx.local.ui_settings;
+    let mem = &mut cx.shared.mem;
     // Reads the object if it is not in RAM.
-    let bpm = cx.shared.mem.with(&settings, |s| s.bpm).unwrap();
+    let bpm = tiermem::with(mem, settings, |s| s.bpm).unwrap();
     // In RAM only: `Err(Full)` if the changes not flushed yet fill the budget.
-    if cx.shared.mem.with_mut(&settings, |s| s.bpm = 120).is_ok() {
+    if tiermem::with_mut(mem, settings, |s| s.bpm = 120).is_ok() {
         save::spawn().ok();
     }
 }
@@ -80,13 +82,13 @@ async fn ui(mut cx: ui::Context) {
 // The only task that writes to the flash. Every task above priority 1 keeps running meanwhile.
 #[task(priority = 1, shared = [mem])]
 async fn save(mut cx: save::Context) {
-    cx.shared.mem.flush().unwrap();
+    tiermem::flush(&mut cx.shared.mem).unwrap();
 }
 
 #[task(binds = RTC_WKUP, priority = 3, shared = [mem], local = [tick_settings])]
 fn tick(mut cx: tick::Context) {
     // Never waits: `None` only if the object is not in RAM and a flush has the flash.
-    if let Some(bpm) = cx.shared.mem.try_with(cx.local.tick_settings, |s| s.bpm).unwrap() {
+    if let Some(bpm) = tiermem::try_with(&mut cx.shared.mem, cx.local.tick_settings, |s| s.bpm).unwrap() {
         // ...
     }
 }
@@ -104,7 +106,7 @@ fn midi(cx: midi::Context) { /* ... */ }
 * Writes: only `flush` (and `unmount`) writes to the flash. Changes made with `with_mut`, `try_with_mut`,
   `insert` and `remove` stay in RAM until then. A flush runs in the caller's task, a few ms per object and
   hundreds of ms when NOR garbage collection runs: call it from a task of the lowest priority.
-* Each method takes the RTIC lock of `mem` for short steps only. It blocks the tasks that share `mem` (up
+* Each function takes the RTIC lock of `mem` for short steps only. It blocks the tasks that share `mem` (up
   to the highest priority among them) and no other task: in the example, the MIDI interrupt always runs.
 * Reads of objects not in RAM run inside the lock: about 85 µs per 256-byte page of SPI NOR at 25 MHz. So do
   the closures given to `with`, `with_mut`, `try_with` and `try_with_mut`: keep them short. The writes of a
@@ -112,7 +114,7 @@ fn midi(cx: midi::Context) { /* ... */ }
 * Priorities. While a flush has the flash, `try_with` and `try_with_mut` return `None` for an object that
   is not in RAM or is being written; objects in RAM keep working. `with` and `with_mut` wait instead, which
   on a single core never ends if they preempted the flush: call `with`, `with_mut` and `flush` from one
-  priority level only. Every other method never waits: call it from anywhere.
+  priority level only. Every other function never waits: call it from anywhere.
 * RAM budget: each object in RAM counts its size plus its serialized size, an estimate of what it owns on
   the heap. Over budget, the least recently used unmodified objects are dropped (they are read again when
   needed). Modified objects stay until a flush: when one more would not fit, `with_mut`, `try_with_mut` and
