@@ -17,7 +17,7 @@
 //!   wait for them, and none of them ever finds a read in progress.
 //! - Writes, by `flush` only: the backend and the object to write are taken out of `Core` inside
 //!   the lock, written outside of it, and put back inside the lock. While the backend is out, the
-//!   storage is busy: a call that needs it returns `Busy`. Nothing waits.
+//!   storage is busy: a call that needs it returns `None`. Nothing waits.
 
 mod cache;
 mod lifecycle;
@@ -35,7 +35,7 @@ use hashbrown::HashMap;
 use rtic_core::Mutex;
 
 use crate::backend::{Backend, Usage};
-use crate::{Error, ObjectId, TierMem};
+use crate::{ObjectId, TierMem};
 use cache::Entry;
 
 /// The state of a `TierMem`.
@@ -92,10 +92,10 @@ impl<B: Backend> Core<B> {
         self.modified_bytes + size <= self.cache_bytes
     }
 
-    /// Calls `on_full` and returns `Error::Full`.
-    fn full<E>(&self) -> Error<E> {
+    /// Calls `on_full` and returns `None`: the modified objects fill the budget.
+    fn full<R>(&self) -> Option<R> {
         (self.on_full)();
-        Error::Full
+        None
     }
 
     /// Puts the backend back after a write.

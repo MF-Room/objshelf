@@ -27,16 +27,13 @@ use crate::{Error, Handle, Storable};
 /// let mut mem = TierMem::<NorBackend<Flash>>::mount(config, 16 * 1024, || {
 ///     save::spawn().ok();
 /// })?;
-/// let handle: Handle<Config> = tiermem::get_or_insert_with(&mut mem, "config", Config::default)?;
+/// let handle: Handle<Settings> =
+///     tiermem::get_or_insert_with(&mut mem, "settings", Settings::default)?.expect("fits");
 ///
-/// // in a task with `shared = [mem]`
+/// // in a task with `shared = [mem]`: `None` means "not now, try again later"
 /// let mem = &mut cx.shared.mem;
-/// let volume = tiermem::with(mem, &handle, |c| c.volume)?; // reads the object if not in RAM
-/// tiermem::with_mut(mem, &handle, |c| c.volume = 3)?; // in RAM until the next flush
-/// match tiermem::with(mem, &handle, |c| c.volume) {
-///     Err(Error::Busy) => { /* a flush has the storage: try again later */ }
-///     result => { /* ... */ }
-/// }
+/// if let Some(brightness) = tiermem::with(mem, &handle, |s| s.brightness)? { /* ... */ }
+/// if tiermem::with_mut(mem, &handle, |s| s.brightness = 3)?.is_none() { /* try again later */ }
 ///
 /// // in the `save` task, of the lowest priority
 /// tiermem::flush(&mut cx.shared.mem)?; // the changes go to the backend
@@ -63,13 +60,19 @@ use crate::{Error, Handle, Storable};
 ///
 /// The writes of a flush run outside of it. Meanwhile the storage is busy.
 ///
-/// # Busy storage
+/// # Not now: `Ok(None)`
 ///
-/// No function waits, so any task can call any of them. Only [`with`] and [`with_mut`] on an
-/// object that is not in RAM need the storage: while a flush has it, they return [`Error::Busy`]
-/// for such an object, and for the one being written (it is out of RAM during its write). Objects
-/// in RAM keep working. Only a task that preempts the flush can see `Busy`: one of a higher
-/// priority. [`flush`] itself returns `Busy` if it preempted another flush.
+/// No function waits, so any task can call any of them. Instead, [`with`], [`with_mut`],
+/// [`insert`], [`get_or_insert_with`] and [`flush`] return `Ok(None)`, having done nothing, when
+/// the call cannot be done now:
+///
+/// - Busy: a flush has the storage, and the call needs it. That is [`with`] and [`with_mut`] on an
+///   object that is not in RAM, or is the one being written (it is out of RAM during its write),
+///   and [`flush`] itself. Objects in RAM keep working. Only a task that preempts the flush, of a
+///   higher priority, can find the storage busy.
+/// - Full: see [RAM budget](#ram-budget).
+///
+/// Try again later. Real errors still come as `Err`.
 ///
 /// # RAM budget
 ///
@@ -79,10 +82,9 @@ use crate::{Error, Handle, Storable};
 /// - Over budget, the least recently used unmodified objects are dropped, with no I/O: they are
 ///   read again when needed. The object just used stays, even alone over budget.
 /// - Modified objects stay until a flush. When an object would become modified and they would
-///   then take more than `cache_bytes`, [`with_mut`] and [`insert`] call the
-///   `on_full` callback given to [`mount`](Self::mount), to start a flush, and return
-///   [`Error::Full`] without changing anything. An object already modified can still change, and
-///   grow over the budget.
+///   then take more than `cache_bytes`, [`with_mut`] and [`insert`] call the `on_full` callback
+///   given to [`mount`](Self::mount), to start a flush, and return `Ok(None)` without changing
+///   anything. An object already modified can still change, and grow over the budget.
 ///
 /// # Durability
 ///
@@ -111,6 +113,7 @@ impl<B: Backend> TierMem<B> {
 
     /// Flushes, then unmounts the backend.
     pub fn unmount(mut self) -> Result<(), Error<B::Error>> {
+        // Owned: no other flush can have the storage.
         flush(&mut self)?;
         self.core.unmount()
     }
@@ -145,32 +148,33 @@ pub fn get<T: Storable, B: Backend>(
 /// Inserts a new object `name` and returns its handle. The object is in RAM, and reaches the
 /// backend at the next [`flush`].
 ///
-/// Returns [`Error::AlreadyExists`] if an object with this name exists, and [`Error::Full`] if
-/// the changes not flushed yet leave no room for it (see [RAM budget](TierMem#ram-budget)).
+/// Returns [`Error::AlreadyExists`] if an object with this name exists, and `Ok(None)` if the
+/// changes not flushed yet leave no room for it (see [RAM budget](TierMem#ram-budget)).
 pub fn insert<T: Storable, B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
     name: &str,
     value: T,
-) -> Result<Handle<T>, Error<B::Error>> {
-    Locked(mem).insert(name, value).map(Handle::new)
+) -> Result<Option<Handle<T>>, Error<B::Error>> {
+    Ok(Locked(mem).insert(name, value)?.map(Handle::new))
 }
 
 /// Handle to the object `name`. If there is no object with this name (as on the first boot),
-/// inserts the value returned by `f` first; `f` only runs in that case.
+/// inserts the value returned by `f` first; `f` only runs in that case, and `Ok(None)` means it
+/// did not fit, as for [`insert`].
 ///
 /// `T` must be the type the object was inserted with.
 pub fn get_or_insert_with<T: Storable, B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
     name: &str,
     f: impl FnOnce() -> T,
-) -> Result<Handle<T>, Error<B::Error>> {
+) -> Result<Option<Handle<T>>, Error<B::Error>> {
     match get(mem, name) {
         Err(Error::NotFound) => match insert(mem, name, f()) {
             // Inserted by another task meanwhile.
-            Err(Error::AlreadyExists) => get(mem, name),
+            Err(Error::AlreadyExists) => get(mem, name).map(Some),
             result => result,
         },
-        result => result,
+        result => result.map(Some),
     }
 }
 
@@ -185,28 +189,28 @@ pub fn remove<T: Storable, B: Backend>(
 }
 
 /// Runs `f` on the object of `handle` and returns its result. Reads the object if it is not in
-/// RAM, or returns [`Error::Busy`] without running `f` if a flush has the storage (see
-/// [Busy storage](TierMem#busy-storage)).
+/// RAM, or returns `Ok(None)` without running `f` if a flush has the storage (see
+/// [Not now](TierMem#not-now-oknone)).
 pub fn with<T: Storable, R, B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
     handle: &Handle<T>,
     f: impl FnOnce(&T) -> R,
-) -> Result<R, Error<B::Error>> {
+) -> Result<Option<R>, Error<B::Error>> {
     Locked(mem).with(handle.id, false, |value: &mut T| f(value))
 }
 
 /// Runs `f` on the object of `handle` with mutable access and returns its result. Reads the
-/// object if it is not in RAM, or returns [`Error::Busy`] without running `f` if a flush has the
-/// storage.
+/// object if it is not in RAM. The change is in RAM when this returns, and reaches the backend at
+/// the next [`flush`].
 ///
-/// The change is in RAM when this returns, and reaches the backend at the next [`flush`].
-/// Returns [`Error::Full`] without running `f` if the changes not flushed yet leave no room for
-/// this object (see [RAM budget](TierMem#ram-budget)).
+/// Returns `Ok(None)` without running `f` if a flush has the storage and the object is not in
+/// RAM, or if the changes not flushed yet leave no room for this object (see
+/// [RAM budget](TierMem#ram-budget)).
 pub fn with_mut<T: Storable, R, B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
     handle: &Handle<T>,
     f: impl FnOnce(&mut T) -> R,
-) -> Result<R, Error<B::Error>> {
+) -> Result<Option<R>, Error<B::Error>> {
     Locked(mem).with(handle.id, true, f)
 }
 
@@ -219,11 +223,13 @@ pub fn usage<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Usage {
 }
 
 /// Writes the changes to the backend: the modified and new objects, then the names, then the
-/// removals. Returns [`Error::Busy`] if another flush has the storage.
+/// removals. Returns `Ok(None)` if another flush has the storage (this one preempted it).
 ///
 /// Each object modified when it starts is written once, so it ends even if an interrupt keeps
 /// modifying objects. It stops at the first error: what is not written stays in RAM for the next
 /// flush.
-pub fn flush<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Result<(), Error<B::Error>> {
+pub fn flush<B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+) -> Result<Option<()>, Error<B::Error>> {
     Locked(mem).flush()
 }

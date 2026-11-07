@@ -63,12 +63,6 @@ pub enum Error<E> {
     AlreadyExists,
     /// The object is cached with another type than the one of the handle.
     WrongType,
-    /// The changes not flushed yet fill the RAM budget: nothing was changed. The callback given to
-    /// [`TierMem::mount`] was called to start a flush; try again once it is done.
-    Full,
-    /// A flush has the storage, and the call needs it: the object is not in RAM, or is the one
-    /// being written. Nothing was done; try again once the flush is done.
-    Busy,
     /// The backend failed.
     Backend(E),
 }

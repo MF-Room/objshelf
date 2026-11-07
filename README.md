@@ -29,14 +29,14 @@ lock itself, for short steps only:
 // Inside your `#[rtic::app]` module. `Flash` is your blocking `NorFlash` driver.
 use serde::{Deserialize, Serialize};
 use tiermem::backend::nor::{NorBackend, NorConfig};
-use tiermem::{Error, Handle, TierMem};
+use tiermem::{Handle, TierMem};
 
 type Mem = TierMem<NorBackend<Flash>>;
 
 // Any `Serialize + Deserialize` type can be stored.
 #[derive(Default, Serialize, Deserialize)]
-struct Config {
-    volume: u8,
+struct Settings {
+    brightness: u8,
     name: String,
 }
 
@@ -47,9 +47,8 @@ struct Shared {
 
 #[local]
 struct Local {
-    // A handle is a `Copy` id: each task gets its own copy.
-    app_config: Handle<Config>,
-    timer_config: Handle<Config>,
+    // A handle is a `Copy` id of the object.
+    settings: Handle<Settings>,
 }
 
 #[init]
@@ -65,25 +64,31 @@ fn init(cx: init::Context) -> (Shared, Local) {
     .unwrap();
     // Finds the object after a reboot, or creates it on the first boot. Before `mem` is shared,
     // the functions take it directly.
-    let handle = tiermem::get_or_insert_with(&mut mem, "config", Config::default).unwrap();
+    let settings = tiermem::get_or_insert_with(&mut mem, "settings", Settings::default)
+        .unwrap()
+        .expect("fits in the RAM budget");
     app::spawn().unwrap();
-    (Shared { mem }, Local { app_config: handle, timer_config: handle })
+    (Shared { mem }, Local { settings })
 }
 
-#[task(priority = 1, shared = [mem], local = [app_config])]
+// Above `save`: it keeps running during a flush, so it can get `None` (see below).
+#[task(priority = 2, shared = [mem], local = [settings])]
 async fn app(mut cx: app::Context) {
-    let handle = cx.local.app_config;
+    let settings = cx.local.settings;
     let mem = &mut cx.shared.mem;
     // Reads the object from flash if it is not in RAM.
-    let volume = tiermem::with(mem, handle, |c| c.volume).unwrap();
+    let Some(brightness) = tiermem::with(mem, settings, |s| s.brightness).unwrap() else {
+        // Not in RAM, and a flush has the flash: try again later.
+        return;
+    };
     // Changes RAM only, until the next flush.
-    match tiermem::with_mut(mem, handle, |c| c.volume = volume + 1) {
-        Ok(()) => {
+    match tiermem::with_mut(mem, settings, |s| s.brightness = brightness + 1).unwrap() {
+        Some(()) => {
             save::spawn().ok();
         }
-        // Unflushed changes fill the budget: `on_full` already spawned `save`. Try again later.
-        Err(Error::Full) => {}
-        Err(error) => panic!("{error:?}"),
+        // A flush has the flash, or unflushed changes fill the budget (`on_full` spawned
+        // `save`): try again later.
+        None => {}
     }
 }
 
@@ -92,21 +97,11 @@ async fn app(mut cx: app::Context) {
 async fn save(mut cx: save::Context) {
     tiermem::flush(&mut cx.shared.mem).unwrap();
 }
-
-// A higher priority can interrupt a flush, so it can get `Busy`.
-#[task(binds = TIM2, priority = 2, shared = [mem], local = [timer_config])]
-fn timer(mut cx: timer::Context) {
-    match tiermem::with(&mut cx.shared.mem, cx.local.timer_config, |c| c.volume) {
-        Ok(volume) => { /* ... */ }
-        // The object is not in RAM and a flush has the flash: try again on the next tick.
-        Err(Error::Busy) => {}
-        Err(error) => panic!("{error:?}"),
-    }
-}
 ```
 
-No function waits, so any task can call any of them. Tasks that don't share `mem` are never blocked by
-tiermem, whatever their priority.
+No function waits, so any task can call any of them. When a call can't be done now, it returns `Ok(None)`
+and does nothing: try again later. Tasks that don't share `mem` are never blocked by tiermem, whatever their
+priority.
 
 ## API
 
@@ -127,14 +122,17 @@ owned `TierMem`.
 | `usage(mem)` | Space of the backend: capacity, used, free, reclaimable by garbage collection, number of objects. |
 | `flush(mem)` | Writes the changes to the flash: changed and new objects, then the names, then the removals. |
 
-Errors, besides `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is not the object's) and
-`Backend` (the flash failed):
+`with`, `with_mut`, `insert`, `get_or_insert_with` and `flush` return `Ok(None)`, having done nothing,
+when the call can't be done now:
 
-* `Full`: `insert` and `with_mut` change nothing when unflushed changes fill the RAM budget. `on_full` was
-  called to start a flush; try again once it is done.
-* `Busy`: `with` and `with_mut` need the flash (the object is not in RAM, or is being written) while a
-  flush has it, or `flush` interrupted another flush. Nothing was done; try again later. Only a task of a
-  higher priority than the flush, which interrupts it, can get it.
+* **Busy:** a flush has the flash, and the call needs it. That is `with` and `with_mut` on an object that is
+  not in RAM or is being written, and `flush` itself. Only a task of a higher priority than the flush, which
+  interrupts it, can get it.
+* **Full:** unflushed changes fill the RAM budget, for `with_mut` and `insert` (and `get_or_insert_with`
+  when it inserts). `on_full` was called to start a flush.
+
+The errors are `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is not the object's) and
+`Backend` (the flash failed).
 
 ## How it works
 
@@ -147,12 +145,12 @@ Errors, besides `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is n
   them short), and for the read of an object not in RAM (about 85 µs per 256-byte page of SPI NOR at
   25 MHz). The writes of a flush run outside of it.
 * **Busy flash.** While a flush has the flash, objects in RAM keep working; `with` and `with_mut` return
-  `Busy` for the others. A task at the flush's priority or below never sees it: it can't run during the
+  `None` for the others. A task at the flush's priority or below never sees it: it can't run during the
   flush.
 * **RAM budget.** Each object in RAM counts its size plus its serialized size, an estimate of what it owns
   on the heap. Over budget, the least recently used unchanged objects are dropped: they are read again
   when needed. Changed objects stay until a flush; when one more would not fit, the call calls `on_full`
-  and returns `Full`.
+  and returns `None`.
 * **Durability.** Changes, inserts and removals reach the flash on `flush` or `unmount`: a reset loses the
   rest. A power cut during a flush leaves each object either as it was or as written, and the next mount
   cleans up.

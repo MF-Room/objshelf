@@ -1,5 +1,5 @@
 //! `flush`, the only code that writes to the backend. Each write takes the backend out of the
-//! core inside the lock (`Busy` if another flush has it), writes outside of the lock, and puts the
+//! core inside the lock (`None` if another flush has it), writes outside of the lock, and puts the
 //! backend back inside it.
 
 use alloc::vec::Vec;
@@ -18,32 +18,37 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
     /// objects. New objects are stored before their names and removed ones lose their names first,
     /// so after a power cut the next mount removes the objects left without a name. It also drops
     /// the names left without an object: those of objects inserted by an interrupt during the
-    /// flush, written with the directory but not yet themselves. Stops at the first error: what is
-    /// not written waits for the next flush.
-    pub(crate) fn flush(&mut self) -> Result<(), Error<B::Error>> {
+    /// flush, written with the directory but not yet themselves. Stops at the first error, or at
+    /// `None` if another flush has the backend: what is not written waits for the next flush.
+    pub(crate) fn flush(&mut self) -> Result<Option<()>, Error<B::Error>> {
         let modified: Vec<ObjectId> = self.lock(|core| {
             let modified = core.cache.iter().filter(|(_, entry)| entry.modified);
             modified.map(|(&id, _)| id).collect()
         });
         for id in modified {
-            self.write_back(id)?;
+            if self.write_back(id)?.is_none() {
+                return Ok(None);
+            }
         }
         self.write_names()
     }
 
-    /// Writes the object `id` back if it is modified. It is out of the cache meanwhile, so
-    /// nothing changes it during the write. If it was removed meanwhile, it is then dropped.
-    fn write_back(&mut self, id: ObjectId) -> Result<(), Error<B::Error>> {
+    /// Writes the object `id` back if it is modified, `None` if another flush has the backend. It
+    /// is out of the cache meanwhile, so nothing changes it during the write. If it was removed
+    /// meanwhile, it is then dropped.
+    fn write_back(&mut self, id: ObjectId) -> Result<Option<()>, Error<B::Error>> {
         let taken = self.lock(|core| {
             if !core.cache.get(&id).is_some_and(|entry| entry.modified) {
-                return Ok(None);
+                return Some(None);
             }
-            let backend = core.backend.take().ok_or(Error::Busy)?;
+            let backend = core.backend.take()?;
             let entry = core.cache.remove(&id).expect("modified, so cached");
-            Ok(Some((backend, entry)))
-        })?;
-        let Some((mut backend, mut entry)) = taken else {
-            return Ok(());
+            Some(Some((backend, entry)))
+        });
+        let (mut backend, mut entry) = match taken {
+            None => return Ok(None),
+            Some(None) => return Ok(Some(())),
+            Some(Some(taken)) => taken,
         };
         let result = entry.value.write(&mut backend, id);
         self.lock(|core| {
@@ -62,23 +67,25 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
                 }
             }
         });
-        result.map_err(Error::Backend)
+        result.map(Some).map_err(Error::Backend)
     }
 
     /// Writes the directory if it changed, then removes the removed objects that the backend
-    /// holds.
-    fn write_names(&mut self) -> Result<(), Error<B::Error>> {
+    /// holds. `None` if another flush has the backend.
+    fn write_names(&mut self) -> Result<Option<()>, Error<B::Error>> {
         let taken = self.lock(|core| {
             if !core.directory_modified {
-                return Ok(None);
+                return Some(None);
             }
-            let backend = core.backend.take().ok_or(Error::Busy)?;
+            let backend = core.backend.take()?;
             core.directory_modified = false;
             let removed = mem::take(&mut core.removed);
-            Ok(Some((backend, core.stored_directory(), removed)))
-        })?;
-        let Some((mut backend, directory, removed)) = taken else {
-            return Ok(());
+            Some(Some((backend, core.stored_directory(), removed)))
+        });
+        let (mut backend, directory, removed) = match taken {
+            None => return Ok(None),
+            Some(None) => return Ok(Some(())),
+            Some(Some(taken)) => taken,
         };
         let result = store_names(&mut backend, &directory, &removed);
         self.lock(|core| {
@@ -88,7 +95,7 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
                 core.removed.extend(removed);
             }
         });
-        result.map_err(Error::Backend)
+        result.map(Some).map_err(Error::Backend)
     }
 }
 

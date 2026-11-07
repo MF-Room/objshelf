@@ -21,18 +21,19 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
         self.lock(|core| core.directory.get(name).copied())
     }
 
-    /// Caches `value` as a new modified object named `name`.
+    /// Caches `value` as a new modified object named `name`. `None` if it does not fit with the
+    /// other modified objects.
     pub(crate) fn insert<T: Storable>(
         &mut self,
         name: &str,
         value: T,
-    ) -> Result<ObjectId, Error<B::Error>> {
+    ) -> Result<Option<ObjectId>, Error<B::Error>> {
         self.lock(|core| {
             if core.directory.contains_key(name) {
                 return Err(Error::AlreadyExists);
             }
             if !core.fits_modified(object::size(&value)) {
-                return Err(core.full());
+                return Ok(core.full());
             }
             let id = ObjectId(core.next_id);
             core.next_id += 1;
@@ -40,7 +41,7 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
             core.directory_modified = true;
             core.cache(id, value, true);
             core.drop_clean(id);
-            Ok(id)
+            Ok(Some(id))
         })
     }
 
