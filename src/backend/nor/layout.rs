@@ -23,8 +23,10 @@ const PAGE_HEADER_SIZE: usize = 20;
 /// Object bytes in one data page.
 pub(super) const PAYLOAD_SIZE: usize = MARKER_OFFSET - PAGE_HEADER_SIZE;
 
-const PAGE_MAGIC: u16 = 0x7A01;
-const SECTOR_MAGIC: u32 = 0x7A53_0001;
+// `0x54` is ASCII `T`, for tiermem, and `0x53` is `S`, for sector. Neither magic is all `0xFF`
+// (erased) or all `0x00`, and a CRC follows each of them.
+const PAGE_MAGIC: u16 = 0x5401;
+const SECTOR_MAGIC: u32 = 0x5453_0001;
 const SECTOR_HEADER_SIZE: usize = 12;
 
 /// Header of a data page.
