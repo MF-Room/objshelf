@@ -132,7 +132,7 @@ owned `TierMem`.
 | `TierMem::unmount(self)` | Flushes, then unmounts the backend. |
 | `list(mem)` | Names of all objects. |
 | `get::<T, _>(mem, name)` | Handle to the object `name`, of type `T`. `NotFound` if it doesn't exist. |
-| `insert(mem, name, value)` | Adds a new object and returns its handle. `AlreadyExists` if the name is taken. |
+| `insert(mem, name, value)` | Adds a new object and returns its handle. `AlreadyExists` if the name is taken, `NameTooLong` over 64 bytes (`MAX_NAME_LEN`). |
 | `get_or_insert_with(mem, name, f)` | Handle to the object `name`, inserting `f()` first if it doesn't exist (first boot). |
 | `remove(mem, handle)` | Removes the object. |
 | `with(mem, &handle, \|v\| ...)` | Runs the closure on the object and returns its result. Reads the object from flash first if it is not in RAM. |
@@ -150,10 +150,11 @@ done nothing, when the call can't be done now:
 * **Full:** unflushed changes fill the RAM budget, for `with_mut` and `insert` (and `get_or_insert_with`
   when it inserts). `on_full` was called to start a flush.
 
-The errors are `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is not the object's), `TooBig`
-(the object alone is bigger than the RAM budget, so `with_mut` and `insert` can never take it) and `Backend`
-(the flash failed). When an object fails to write, `flush` still writes the others and does the removals,
-and returns the first error: the object stays in RAM for the next flush.
+The errors are `NotFound`, `AlreadyExists`, `NameTooLong` (over `MAX_NAME_LEN`), `WrongType` (the
+handle's type is not the object's), `TooBig` (the object alone is bigger than the RAM budget, so
+`with_mut` and `insert` can never take it) and `Backend` (the flash failed). When an object fails to
+write, `flush` still writes the others and does the removals, and returns the first error: the object
+stays in RAM for the next flush.
 
 ## How it works
 
@@ -181,10 +182,16 @@ and returns the first error: the object stays in RAM for the next flush.
   both are left: the name never ends up with no object or two. Objects that must stay consistent with
   each other should be flushed together, with `flush`.
 * **Names and types.** Each object is stored with its name, and mount reads the names from the objects:
-  there is no directory to lose, and an `insert` or a `remove` writes only that object. The name is
-  written again with each write of its object: keep names short. An object must be read with the type
-  it was inserted with. A cached object of
-  another type gives `WrongType`, but the backend does not check types yet (see TODO).
+  there is no directory to lose, and an `insert` or a `remove` writes only that object. A name is at
+  most 64 bytes (`MAX_NAME_LEN`), as it is written again with each write of its object. An object must
+  be read with the type it was inserted with. A cached object of another type gives `WrongType`, but the
+  backend does not check types yet (see TODO).
+* **Limits.** An object must fit in the RAM budget (`TooBig` otherwise) and, serialized with its name,
+  in the free flash: at most 65535 pages of 235 bytes (about 15 MiB) on NOR. An object that doesn't fit
+  fails its flush with `NoSpace`, and the flush goes on with the others. A read or write also holds the
+  whole serialized object on the heap while it runs. The NOR region is aligned to the erase size, has at
+  least 2 sectors (one stays free for garbage collection) and at most 16 MiB, and is used by nothing
+  else.
 
 Details: the `TierMem` documentation in [`src/api.rs`](src/api.rs), the public API. The engine behind it is
 in [`src/memory`](src/memory/mod.rs).
@@ -236,13 +243,14 @@ Requirements, guarantees, time and space complexity: module documentation in
   serialized-size estimate
 - [x] `Error::TooBig` from `with_mut` and `insert` for an object bigger than the whole RAM budget, instead
   of `None` forever
-- [x] A flush writes the other objects and the names when one object fails to write (for example with
-  `NoSpace`), and returns the first error at the end, so one failing object does not block every write
+- [x] A flush writes the other objects and does the removals when one object fails to write (for example
+  with `NoSpace`), and returns the first error at the end, so one failing object does not block every
+  write
 - [x] Names stored with the objects instead of in a directory object, which was a single point of
   failure (lost, mount removed every object) and was rewritten whole on every `insert` or `remove`
 - [ ] Type check on read: a stored type tag or schema hash in the backend, instead of a postcard error
   or a wrong decode
-- [ ] Max name length (a name is written again with each write of its object)
-- [ ] Max object size, flash region used by tiermem
+- [x] Max name length: `MAX_NAME_LEN`, 64 bytes, `NameTooLong` from `insert`
+- [x] Max object size and flash region used by tiermem: documented (Limits)
 - [ ] Schema versioning and migration of stored types
 - [x] Host tests with a simulated `NorFlash` (power cuts, two geometries), `cargo test` in CI

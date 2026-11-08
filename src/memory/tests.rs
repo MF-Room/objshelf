@@ -14,7 +14,7 @@ use crate::backend::Backend;
 use crate::backend::nor::mock::{Cut, MockError, MockFlash};
 use crate::backend::nor::{NorBackend, NorConfig, NorError};
 use crate::{
-    Error, Handle, Mutex, ObjectId, Storable, TierMem, flush, flush_object, get,
+    Error, Handle, MAX_NAME_LEN, Mutex, ObjectId, Storable, TierMem, flush, flush_object, get,
     get_or_insert_with, insert, list, remove, usage, with, with_mut,
 };
 
@@ -159,6 +159,22 @@ fn insert_get_and_access() {
         .unwrap();
     assert_eq!(with(&mut mem, &blob, |b| b.0.len()).unwrap().unwrap(), 2);
     assert_eq!(list(&mut mem), ["blob", "settings"]);
+}
+
+#[test]
+fn names_are_at_most_max_name_len_bytes() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let longest = "n".repeat(MAX_NAME_LEN);
+    insert(&mut mem, &longest, 1u32).unwrap().unwrap();
+    // Counted in bytes: each `é` takes 2.
+    let too_long = "é".repeat(MAX_NAME_LEN / 2 + 1);
+    let inserted = insert(&mut mem, &too_long, 2u32);
+    assert!(matches!(inserted, Err(Error::NameTooLong)));
+    let inserted = get_or_insert_with(&mut mem, &too_long, || 2u32);
+    assert!(matches!(inserted, Err(Error::NameTooLong)));
+    flush(&mut mem).unwrap().unwrap();
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(list(&mut mem), [longest]);
 }
 
 #[test]

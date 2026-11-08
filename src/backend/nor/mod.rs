@@ -65,7 +65,8 @@
 //! Flash: 235 payload bytes per 256-byte page, page 0 of each sector for its header, one sector
 //! kept free, at least one page per object. On a whole W25Q16JV (512 sectors) that is at most
 //! 511 × 15 × 235 B ≈ 1.72 MiB of live data. An update also needs room for its new version before
-//! the old one is released.
+//! the old one is released. An object, serialized with its name, takes at most 65535 pages
+//! (about 15 MiB) and must fit in the free space: `write` returns [`NorError::NoSpace`] otherwise.
 
 mod layout;
 #[cfg(test)]

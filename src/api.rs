@@ -155,7 +155,8 @@ pub fn get<T: Storable, B: Backend>(
 /// Inserts a new object `name` and returns its handle. The object is in RAM, and reaches the
 /// backend at the next [`flush`].
 ///
-/// Returns [`Error::AlreadyExists`] if an object with this name exists, `Ok(None)` if the changes
+/// Returns [`Error::AlreadyExists`] if an object with this name exists, [`Error::NameTooLong`] if
+/// `name` is longer than [`MAX_NAME_LEN`](crate::MAX_NAME_LEN) bytes, `Ok(None)` if the changes
 /// not flushed yet leave no room for it, and [`Error::TooBig`] if it is bigger than the whole
 /// budget (see [RAM budget](TierMem#ram-budget)).
 pub fn insert<T: Storable, B: Backend>(
@@ -167,8 +168,8 @@ pub fn insert<T: Storable, B: Backend>(
 }
 
 /// Handle to the object `name`. If there is no object with this name (as on the first boot),
-/// inserts the value returned by `f` first; `f` only runs in that case, and `Ok(None)` or
-/// [`Error::TooBig`] mean it did not fit, as for [`insert`].
+/// inserts the value returned by `f` first; `f` only runs in that case, and it fails as
+/// [`insert`] does.
 ///
 /// `T` must be the type the object was inserted with.
 pub fn get_or_insert_with<T: Storable, B: Backend>(

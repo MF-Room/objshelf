@@ -19,6 +19,11 @@ pub use api::{
 /// implements it. Implement it to share a `TierMem` without RTIC.
 pub use rtic_core::Mutex;
 
+/// Longest name of an object, in bytes of UTF-8. A name is written again with each write of its
+/// object, and this keeps it in the first page of the object on NOR flash, so mount reads one page
+/// per object to find the names.
+pub const MAX_NAME_LEN: usize = 64;
+
 /// Identifier of an object stored in a [`backend::Backend`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjectId(u32);
@@ -64,6 +69,8 @@ pub enum Error<E> {
     NotFound,
     /// An object with this name already exists.
     AlreadyExists,
+    /// The name is longer than [`MAX_NAME_LEN`] bytes.
+    NameTooLong,
     /// The object is cached with another type than the one of the handle.
     WrongType,
     /// The object alone takes more RAM than the whole budget, so it can never be inserted or

@@ -10,7 +10,7 @@ use rtic_core::Mutex;
 use super::object;
 use super::{Core, Locked};
 use crate::backend::Backend;
-use crate::{Error, ObjectId, Storable, TierMem};
+use crate::{Error, MAX_NAME_LEN, ObjectId, Storable, TierMem};
 
 impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
     pub(crate) fn list(&mut self) -> Vec<String> {
@@ -28,6 +28,9 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
         name: &str,
         value: T,
     ) -> Result<Option<ObjectId>, Error<B::Error>> {
+        if name.len() > MAX_NAME_LEN {
+            return Err(Error::NameTooLong);
+        }
         self.lock(|core| {
             if core.directory.contains_key(name) {
                 return Err(Error::AlreadyExists);
