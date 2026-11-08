@@ -71,7 +71,7 @@ fn init(cx: init::Context) -> (Shared, Local) {
     (Shared { mem }, Local { settings })
 }
 
-// Above `save`: it keeps running during a flush, so it can get `None` (see below).
+// Above the tasks that write: it keeps running during a flush, so it can get `None` (see below).
 #[task(priority = 2, shared = [mem], local = [settings])]
 async fn app(mut cx: app::Context) {
     let settings = cx.local.settings;
@@ -83,8 +83,9 @@ async fn app(mut cx: app::Context) {
     };
     // Changes RAM only, until the next flush.
     match tiermem::with_mut(mem, settings, |s| s.brightness = brightness + 1).unwrap() {
+        // Writes the settings soon, and only them.
         Some(()) => {
-            save::spawn().ok();
+            save_settings::spawn(*settings).ok();
         }
         // A flush has the flash, or unflushed changes fill the budget (`on_full` spawned
         // `save`): try again later.
@@ -92,10 +93,20 @@ async fn app(mut cx: app::Context) {
     }
 }
 
-// The only task that writes to the flash. Every task above priority 1 keeps running meanwhile.
+// The tasks that write to the flash, at the lowest priority: every task above it keeps running
+// meanwhile. With the same priority, neither interrupts the other, so neither gets `None`.
+
+// Writes all the changes. Spawned by `on_full`: only a full flush frees the whole budget.
 #[task(priority = 1, shared = [mem])]
 async fn save(mut cx: save::Context) {
     tiermem::flush(&mut cx.shared.mem).unwrap();
+}
+
+// Writes only the settings: the other changes stay in RAM until `save` runs. A handle is `Copy`, so
+// it can be a spawn argument.
+#[task(priority = 1, shared = [mem])]
+async fn save_settings(mut cx: save_settings::Context, settings: Handle<Settings>) {
+    tiermem::flush_object(&mut cx.shared.mem, &settings).unwrap();
 }
 ```
 
