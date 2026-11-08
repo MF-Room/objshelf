@@ -14,7 +14,8 @@
 //!   needed: every byte is programmed at most once between erases, and only from `0xFF`. Chips with
 //!   internal ECC (`WRITE_SIZE > 1`) are not supported.
 //! - **Region**: aligned to `ERASE_SIZE`, at least 2 sectors (one is kept free for garbage
-//!   collection), at most 65536 pages (16 MiB), used by nothing else.
+//!   collection), at most 65536 pages (16 MiB), used by nothing else: a sector without a
+//!   tiermem header is erased when it is needed.
 //! - **Blocking**: each flash operation runs to completion when the driver is called, and so does
 //!   each backend operation.
 //! - **Values**: `Serialize` / `DeserializeOwned` (postcard).
@@ -43,7 +44,10 @@
 //! | GC, per sector reclaimed | up to `2 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 2 small writes | `O(S + P)` |
 //!
 //! Hash map operations are expected `O(1)`. Garbage collection only runs inside a `write` that
-//! lacks space, possibly for several sectors. Opening a sector never used before also erases it.
+//! lacks space, possibly for several sectors. Opening a sector without a header also erases it,
+//! even if it reads blank: an erase cut by a power loss can leave cells that read `0xFF` but are
+//! not fully erased, and nothing tells them apart from a sector never used. So on a fresh chip,
+//! the first writes erase each sector once, and mount reads only page 0 of each sector.
 //!
 //! On the W25Q16JV at 25 MHz: page read ≈ 0.1 ms, page write 0.4 ms (3 ms max), sector erase
 //! 45 ms (400 ms max), mount of 2 MiB ≈ 0.7 s of SPI reads.
