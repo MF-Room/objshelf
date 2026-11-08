@@ -29,11 +29,9 @@ const PAGE_MAGIC: u16 = 0x5401;
 const SECTOR_MAGIC: u16 = 0x5453;
 
 /// Version of the on-flash format, in each sector header. Mount fails on a sector of another
-/// version instead of erasing it as unformatted.
-///
-/// - 1: names in a directory object, id 0.
-/// - 2: each object holds its name, serialized before its value.
-pub(super) const FORMAT_VERSION: u16 = 2;
+/// version instead of erasing it as unformatted. 0 until the first release: change it when a
+/// released format changes.
+pub(super) const FORMAT_VERSION: u16 = 0;
 const SECTOR_HEADER_SIZE: usize = 12;
 
 /// Header of a data page.
