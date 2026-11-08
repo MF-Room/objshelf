@@ -1,6 +1,6 @@
-//! `flush`, the only code that writes to the backend. Each write takes the backend out of the
-//! core inside the lock (`None` if another flush has it), writes outside of the lock, and puts the
-//! backend back inside it.
+//! `flush` and `flush_object`, the only code that writes to the backend. Each write takes the
+//! backend out of the core inside the lock (`None` if another flush has it), writes outside of
+//! the lock, and puts the backend back inside it.
 
 use alloc::vec::Vec;
 use core::mem;
@@ -29,6 +29,20 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
             if self.write_back(id)?.is_none() {
                 return Ok(None);
             }
+        }
+        self.write_names()
+    }
+
+    /// Writes the object `id` if it is modified, then the directory if it changed, as a new object
+    /// needs its name stored, and removes the removed objects. The directory may then name new
+    /// objects not written yet: the next mount drops those names if they never are. `None` if
+    /// another flush has the backend.
+    pub(crate) fn flush_object(&mut self, id: ObjectId) -> Result<Option<()>, Error<B::Error>> {
+        if !self.lock(|core| core.is_named(id)) {
+            return Err(Error::NotFound);
+        }
+        if self.write_back(id)?.is_none() {
+            return Ok(None);
         }
         self.write_names()
     }

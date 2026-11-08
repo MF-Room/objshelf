@@ -41,11 +41,11 @@ use crate::{Error, Handle, Storable};
 ///
 /// # Writes
 ///
-/// Only [`flush`] (and [`unmount`](Self::unmount)) writes to the backend. Changes, [`insert`] and
-/// [`remove`] included, stay in RAM until then. A flush runs in the caller's task: a few ms per
-/// object, and hundreds of ms when NOR garbage collection runs (a sector erase can take 400 ms on
-/// SPI NOR). Call it from a task of the lowest priority, so that every other task keeps running
-/// meanwhile.
+/// Only [`flush`], [`flush_object`] (which writes one object) and [`unmount`](Self::unmount) write
+/// to the backend. Changes, [`insert`] and [`remove`] included, stay in RAM until then. A flush
+/// runs in the caller's task: a few ms per object, and hundreds of ms when NOR garbage collection
+/// runs (a sector erase can take 400 ms on SPI NOR). Call it from a task of the lowest priority,
+/// so that every other task keeps running meanwhile.
 ///
 /// # Locking
 ///
@@ -63,13 +63,13 @@ use crate::{Error, Handle, Storable};
 /// # Not now: `Ok(None)`
 ///
 /// No function waits, so any task can call any of them. Instead, [`with`], [`with_mut`],
-/// [`insert`], [`get_or_insert_with`] and [`flush`] return `Ok(None)`, having done nothing, when
-/// the call cannot be done now:
+/// [`insert`], [`get_or_insert_with`], [`flush`] and [`flush_object`] return `Ok(None)`, having
+/// done nothing, when the call cannot be done now:
 ///
 /// - Busy: a flush has the storage, and the call needs it. That is [`with`] and [`with_mut`] on an
 ///   object that is not in RAM, or is the one being written (it is out of RAM during its write),
-///   and [`flush`] itself. Objects in RAM keep working. Only a task that preempts the flush, of a
-///   higher priority, can find the storage busy.
+///   and the flushes themselves. Objects in RAM keep working. Only a task that preempts the
+///   flush, of a higher priority, can find the storage busy.
 /// - Full: see [RAM budget](#ram-budget).
 ///
 /// Try again later. Real errors still come as `Err`.
@@ -88,9 +88,10 @@ use crate::{Error, Handle, Storable};
 ///
 /// # Durability
 ///
-/// Changes reach the backend on [`flush`] or [`unmount`](Self::unmount): a reset loses the rest.
-/// A power cut during a flush leaves each object either as it was or as written, and the next
-/// mount cleans up the names and objects the flush left half done.
+/// Changes reach the backend on [`flush`], [`flush_object`] for that object, or
+/// [`unmount`](Self::unmount): a reset loses the rest. A power cut during a flush leaves each
+/// object either as it was or as written, and the next mount cleans up the names and objects the
+/// flush left half done.
 pub struct TierMem<B: Backend> {
     pub(crate) core: Core<B>,
 }
@@ -232,4 +233,18 @@ pub fn flush<B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
 ) -> Result<Option<()>, Error<B::Error>> {
     Locked(mem).flush()
+}
+
+/// Writes the object of `handle` to the backend if it is modified, and the other modified objects
+/// stay in RAM. Then writes the names if they changed, as a new object needs its name stored, and
+/// the removals.
+///
+/// Returns [`Error::NotFound`] if the object is removed, and `Ok(None)` if another flush has the
+/// storage, as [`flush`] does. Objects that must stay consistent with each other should be
+/// flushed together, with [`flush`].
+pub fn flush_object<T: Storable, B: Backend>(
+    mem: &mut impl Mutex<T = TierMem<B>>,
+    handle: &Handle<T>,
+) -> Result<Option<()>, Error<B::Error>> {
+    Locked(mem).flush_object(handle.id)
 }

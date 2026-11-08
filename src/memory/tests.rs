@@ -12,8 +12,8 @@ use crate::backend::Backend;
 use crate::backend::nor::mock::{Cut, MockFlash};
 use crate::backend::nor::{NorBackend, NorConfig, NorError};
 use crate::{
-    Error, Handle, Mutex, TierMem, flush, get, get_or_insert_with, insert, list, remove, usage,
-    with, with_mut,
+    Error, Handle, Mutex, TierMem, flush, flush_object, get, get_or_insert_with, insert, list,
+    remove, usage, with, with_mut,
 };
 
 type Flash = MockFlash<1024>;
@@ -212,6 +212,57 @@ fn changes_reach_the_flash_on_flush() {
     let mut mem = mount(power_cut(mem), CACHE);
     assert_eq!(with(&mut mem, &a, |a| *a).unwrap().unwrap(), 3);
     mem.unmount().unwrap();
+}
+
+#[test]
+fn flush_object_writes_only_that_object() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let a = insert(&mut mem, "a", 1u32).unwrap().unwrap();
+    let b = insert(&mut mem, "b", 2u32).unwrap().unwrap();
+    flush(&mut mem).unwrap().unwrap();
+    with_mut(&mut mem, &a, |a| *a = 10).unwrap().unwrap();
+    with_mut(&mut mem, &b, |b| *b = 20).unwrap().unwrap();
+    flush_object(&mut mem, &a).unwrap().unwrap();
+    assert!(!mem.core.cache[&a.id].modified);
+    assert!(mem.core.cache[&b.id].modified);
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(with(&mut mem, &a, |a| *a).unwrap().unwrap(), 10);
+    assert_eq!(
+        with(&mut mem, &b, |b| *b).unwrap().unwrap(),
+        2,
+        "lost without a flush"
+    );
+
+    let stored = |mem: &Mem| mem.core.backend.as_ref().unwrap().usage();
+    let before = stored(&mem);
+    flush_object(&mut mem, &a).unwrap().unwrap();
+    assert_eq!(stored(&mem), before, "unmodified: nothing written");
+    remove(&mut mem, b).unwrap();
+    assert!(matches!(flush_object(&mut mem, &b), Err(Error::NotFound)));
+}
+
+#[test]
+fn a_new_object_flushed_alone_survives_a_power_cut() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let a = insert(&mut mem, "a", 1u32).unwrap().unwrap();
+    insert(&mut mem, "b", 2u32).unwrap().unwrap();
+    flush_object(&mut mem, &a).unwrap().unwrap();
+    // The names were stored with the one of `b`, which was not: the mount drops it.
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(list(&mut mem), ["a"]);
+    assert_eq!(with(&mut mem, &a, |a| *a).unwrap().unwrap(), 1);
+    // The directory and `a`.
+    assert_eq!(usage(&mut mem).objects, 2);
+
+    // Without a power cut, the next flush writes `b`, whose name is already stored.
+    let b = insert(&mut mem, "b", 2u32).unwrap().unwrap();
+    insert(&mut mem, "c", 3u32).unwrap().unwrap();
+    flush_object(&mut mem, &b).unwrap().unwrap();
+    flush(&mut mem).unwrap().unwrap();
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(list(&mut mem), ["a", "b", "c"]);
+    let c: Handle<u32> = get(&mut mem, "c").unwrap();
+    assert_eq!(with(&mut mem, &c, |c| *c).unwrap().unwrap(), 3);
 }
 
 #[test]

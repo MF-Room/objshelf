@@ -5,7 +5,7 @@
 //! - `object`: cached objects with their type erased.
 //! - `cache`: cached objects, their use by `with` and `with_mut`, and their reads.
 //! - `names`: the names, `insert` and `remove`.
-//! - `write`: `flush`, the only code that writes to the backend.
+//! - `write`: `flush` and `flush_object`, the only code that writes to the backend.
 //! - `lifecycle`: mount, with the name directory (object 0), and unmount.
 //!
 //! The lock is the one of the RTIC resource: it blocks the tasks that share the `TierMem`, and
@@ -15,9 +15,9 @@
 //!   until a flush.
 //! - Reads of objects that are not in RAM: inside the lock too, so the tasks that share the memory
 //!   wait for them, and none of them ever finds a read in progress.
-//! - Writes, by `flush` only: the backend and the object to write are taken out of `Core` inside
-//!   the lock, written outside of it, and put back inside the lock. While the backend is out, the
-//!   storage is busy: a call that needs it returns `None`. Nothing waits.
+//! - Writes, by the flushes only: the backend and the object to write are taken out of `Core`
+//!   inside the lock, written outside of it, and put back inside the lock. While the backend is
+//!   out, the storage is busy: a call that needs it returns `None`. Nothing waits.
 
 mod cache;
 mod lifecycle;

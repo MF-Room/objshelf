@@ -121,13 +121,14 @@ owned `TierMem`.
 | `with_mut(mem, &handle, \|v\| ...)` | Same, with mutable access. The change stays in RAM until the next flush. |
 | `usage(mem)` | Space of the backend: capacity, used, free, reclaimable by garbage collection, number of objects. |
 | `flush(mem)` | Writes the changes to the flash: changed and new objects, then the names, then the removals. |
+| `flush_object(mem, &handle)` | Writes this object if it changed, then the names and removals if there are any (a new object needs its name stored). The other changed objects stay in RAM. |
 
-`with`, `with_mut`, `insert`, `get_or_insert_with` and `flush` return `Ok(None)`, having done nothing,
-when the call can't be done now:
+`with`, `with_mut`, `insert`, `get_or_insert_with`, `flush` and `flush_object` return `Ok(None)`, having
+done nothing, when the call can't be done now:
 
 * **Busy:** a flush has the flash, and the call needs it. That is `with` and `with_mut` on an object that is
-  not in RAM or is being written, and `flush` itself. Only a task of a higher priority than the flush, which
-  interrupts it, can get it.
+  not in RAM or is being written, and the flushes themselves. Only a task of a higher priority than the
+  flush, which interrupts it, can get it.
 * **Full:** unflushed changes fill the RAM budget, for `with_mut` and `insert` (and `get_or_insert_with`
   when it inserts). `on_full` was called to start a flush.
 
@@ -136,9 +137,9 @@ The errors are `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is no
 
 ## How it works
 
-* **Writes.** Only `flush` (and `unmount`) writes to the flash. It takes a few ms per object, and hundreds
-  of ms when NOR garbage collection erases a sector. It runs in the caller's task: call it from a task of
-  the lowest priority, so that every other task keeps running.
+* **Writes.** Only `flush`, `flush_object` and `unmount` write to the flash. A flush takes a few ms per
+  object, and hundreds of ms when NOR garbage collection erases a sector. It runs in the caller's task:
+  call it from a task of the lowest priority, so that every other task keeps running.
 * **Locking.** Each function takes the lock of `mem` for short steps only: never call them inside
   `cx.shared.mem.lock(...)`. The lock blocks the tasks that share `mem`, up to the highest priority among
   them, and no other task. It is held for RAM work, for the closures given to `with` and `with_mut` (keep
@@ -151,9 +152,10 @@ The errors are `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is no
   on the heap. Over budget, the least recently used unchanged objects are dropped: they are read again
   when needed. Changed objects stay until a flush; when one more would not fit, the call calls `on_full`
   and returns `None`.
-* **Durability.** Changes, inserts and removals reach the flash on `flush` or `unmount`: a reset loses the
-  rest. A power cut during a flush leaves each object either as it was or as written, and the next mount
-  cleans up.
+* **Durability.** Changes, inserts and removals reach the flash on `flush` or `unmount`, or on
+  `flush_object` for one object: a reset loses the rest. A power cut during a flush leaves each object
+  either as it was or as written, and the next mount cleans up. Objects that must stay consistent with
+  each other should be flushed together, with `flush`.
 * **Names and types.** The names are kept in RAM and rewritten whole by the flush after an `insert` or a
   `remove`: keep them short. An object must be read with the type it was inserted with. A cached object of
   another type gives `WrongType`, but the backend does not check types yet (see TODO).
@@ -208,6 +210,11 @@ Requirements, guarantees, time and space complexity: module documentation in
   object (id 0), LRU read cache with a RAM budget, changes kept in RAM until a flush
 - [ ] RAM accounting: the size of an object in RAM is estimated from its serialized size (spare `Vec`
   capacity is not counted)
+- [ ] An object bigger than the whole RAM budget gets `None` forever from `with_mut` and `insert`, since
+  no flush can make room: return a real error instead, such as `Error::TooBig`
+- [ ] One object that fails to write at every flush (for example with `NoSpace`) blocks all other writes,
+  the names included, since a flush stops at the first error: write the others and the names anyway,
+  and return the first error at the end
 - [ ] The directory is a single point of failure: if it is lost (corrupted sector header), mount removes
   every object
 - [ ] Type check on read: a stored type tag or schema hash in the backend, instead of a postcard error

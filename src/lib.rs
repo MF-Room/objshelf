@@ -11,7 +11,8 @@ use core::marker::PhantomData;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub use api::{
-    TierMem, flush, get, get_or_insert_with, insert, list, remove, usage, with, with_mut,
+    TierMem, flush, flush_object, get, get_or_insert_with, insert, list, remove, usage, with,
+    with_mut,
 };
 /// The lock trait of RTIC 2 (`rtic::Mutex`): the functions of this crate take anything that
 /// implements it. Implement it to share a `TierMem` without RTIC.
