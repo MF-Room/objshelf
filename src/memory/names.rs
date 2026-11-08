@@ -22,7 +22,7 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
     }
 
     /// Caches `value` as a new modified object named `name`. `None` if it does not fit with the
-    /// other modified objects.
+    /// other modified objects, `TooBig` if it never fits.
     pub(crate) fn insert<T: Storable>(
         &mut self,
         name: &str,
@@ -32,7 +32,11 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
             if core.directory.contains_key(name) {
                 return Err(Error::AlreadyExists);
             }
-            if !core.fits_modified(object::size(&value)) {
+            let size = object::size(&value);
+            if size > core.cache_bytes {
+                return Err(Error::TooBig);
+            }
+            if !core.fits_modified(size) {
                 return Ok(core.full());
             }
             let id = ObjectId(core.next_id);

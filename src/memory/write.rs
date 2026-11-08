@@ -18,19 +18,33 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
     /// objects. New objects are stored before their names and removed ones lose their names first,
     /// so after a power cut the next mount removes the objects left without a name. It also drops
     /// the names left without an object: those of objects inserted by an interrupt during the
-    /// flush, written with the directory but not yet themselves. Stops at the first error, or at
-    /// `None` if another flush has the backend: what is not written waits for the next flush.
+    /// flush, written with the directory but not yet themselves, and those of new objects whose
+    /// write failed.
+    ///
+    /// An object that fails to write stays modified, and the others and the names are still
+    /// written, so that one object failing at every flush does not block them: the first error is
+    /// returned at the end. Stops at `None` if another flush has the backend. What is not written
+    /// waits for the next flush.
     pub(crate) fn flush(&mut self) -> Result<Option<()>, Error<B::Error>> {
         let modified: Vec<ObjectId> = self.lock(|core| {
             let modified = core.cache.iter().filter(|(_, entry)| entry.modified);
             modified.map(|(&id, _)| id).collect()
         });
+        let mut first_error = None;
         for id in modified {
-            if self.write_back(id)?.is_none() {
-                return Ok(None);
+            match self.write_back(id) {
+                Ok(Some(())) => {}
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        self.write_names()
+        let names = self.write_names();
+        match first_error {
+            Some(error) => Err(error),
+            None => names,
+        }
     }
 
     /// Writes the object `id` if it is modified, then the directory if it changed, as a new object

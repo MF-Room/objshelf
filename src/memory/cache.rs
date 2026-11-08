@@ -37,8 +37,8 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
 impl<B: Backend> Core<B> {
     /// Runs `f` on the object `id`, read from the backend first if it is not in RAM: `None` if
     /// a flush has the backend. With `modify`, the object is then modified, or `None` without
-    /// running `f` if it does not fit with the other modified objects. Unmodified objects over
-    /// the budget are dropped, the one just used left out.
+    /// running `f` if it does not fit with the other modified objects (`TooBig` if it never
+    /// fits). Unmodified objects over the budget are dropped, the one just used left out.
     fn access<T: Storable, R>(
         &mut self,
         id: ObjectId,
@@ -53,8 +53,13 @@ impl<B: Backend> Core<B> {
         if !value.is::<T>() {
             return Err(Error::WrongType);
         }
-        if modify && !entry.modified && !self.fits_modified(entry.size) {
-            return Ok(self.full());
+        if modify && !entry.modified {
+            if entry.size > self.cache_bytes {
+                return Err(Error::TooBig);
+            }
+            if !self.fits_modified(entry.size) {
+                return Ok(self.full());
+            }
         }
         let tick = self.next_tick();
         let entry = self.cache.get_mut(&id).expect("loaded");

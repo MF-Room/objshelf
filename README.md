@@ -143,8 +143,10 @@ done nothing, when the call can't be done now:
 * **Full:** unflushed changes fill the RAM budget, for `with_mut` and `insert` (and `get_or_insert_with`
   when it inserts). `on_full` was called to start a flush.
 
-The errors are `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is not the object's) and
-`Backend` (the flash failed).
+The errors are `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is not the object's), `TooBig`
+(the object alone is bigger than the RAM budget, so `with_mut` and `insert` can never take it) and `Backend`
+(the flash failed). When an object fails to write, `flush` still writes the others and the names, and
+returns the first error: the object stays in RAM for the next flush.
 
 ## How it works
 
@@ -162,7 +164,8 @@ The errors are `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is no
 * **RAM budget.** Each object in RAM counts its size plus its serialized size, an estimate of what it owns
   on the heap. Over budget, the least recently used unchanged objects are dropped: they are read again
   when needed. Changed objects stay until a flush; when one more would not fit, the call calls `on_full`
-  and returns `None`.
+  and returns `None`. An object bigger than the whole budget gets `TooBig` instead: no flush can make
+  room for it.
 * **Durability.** Changes, inserts and removals reach the flash on `flush` or `unmount`, or on
   `flush_object` for one object: a reset loses the rest. A power cut during a flush leaves each object
   either as it was or as written, and the next mount cleans up. Objects that must stay consistent with
@@ -216,16 +219,14 @@ Requirements, guarantees, time and space complexity: module documentation in
     `u32` version counter (wraps after 4 billion writes)
   - first use of a fresh chip erases each sector when it is first opened (one erase per sector)
   - power cut during mount, which can write (stale pages marked obsolete): not tested yet
-- [ ] Protection policy at mount: clear or fail
 - [x] Implement `TierMem` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, directory
   object (id 0), LRU read cache with a RAM budget, changes kept in RAM until a flush
 - [ ] RAM accounting: the size of an object in RAM is estimated from its serialized size (spare `Vec`
   capacity is not counted)
-- [ ] An object bigger than the whole RAM budget gets `None` forever from `with_mut` and `insert`, since
-  no flush can make room: return a real error instead, such as `Error::TooBig`
-- [ ] One object that fails to write at every flush (for example with `NoSpace`) blocks all other writes,
-  the names included, since a flush stops at the first error: write the others and the names anyway,
-  and return the first error at the end
+- [x] `Error::TooBig` from `with_mut` and `insert` for an object bigger than the whole RAM budget, instead
+  of `None` forever
+- [x] A flush writes the other objects and the names when one object fails to write (for example with
+  `NoSpace`), and returns the first error at the end, so one failing object does not block every write
 - [ ] The directory is a single point of failure: if it is lost (corrupted sector header), mount removes
   every object
 - [ ] Type check on read: a stored type tag or schema hash in the backend, instead of a postcard error

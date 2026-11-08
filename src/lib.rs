@@ -64,6 +64,9 @@ pub enum Error<E> {
     AlreadyExists,
     /// The object is cached with another type than the one of the handle.
     WrongType,
+    /// The object alone takes more RAM than the whole budget, so it can never be inserted or
+    /// become modified: no flush can make room for it.
+    TooBig,
     /// The backend failed.
     Backend(E),
 }

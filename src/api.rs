@@ -85,6 +85,9 @@ use crate::{Error, Handle, Storable};
 ///   then take more than `cache_bytes`, [`with_mut`] and [`insert`] call the `on_full` callback
 ///   given to [`mount`](Self::mount), to start a flush, and return `Ok(None)` without changing
 ///   anything. An object already modified can still change, and grow over the budget.
+/// - An object that alone takes more than `cache_bytes` can never be inserted or become
+///   modified, as no flush can make room for it: [`with_mut`] and [`insert`] return
+///   [`Error::TooBig`]. It can still be read.
 ///
 /// # Durability
 ///
@@ -149,8 +152,9 @@ pub fn get<T: Storable, B: Backend>(
 /// Inserts a new object `name` and returns its handle. The object is in RAM, and reaches the
 /// backend at the next [`flush`].
 ///
-/// Returns [`Error::AlreadyExists`] if an object with this name exists, and `Ok(None)` if the
-/// changes not flushed yet leave no room for it (see [RAM budget](TierMem#ram-budget)).
+/// Returns [`Error::AlreadyExists`] if an object with this name exists, `Ok(None)` if the changes
+/// not flushed yet leave no room for it, and [`Error::TooBig`] if it is bigger than the whole
+/// budget (see [RAM budget](TierMem#ram-budget)).
 pub fn insert<T: Storable, B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
     name: &str,
@@ -160,8 +164,8 @@ pub fn insert<T: Storable, B: Backend>(
 }
 
 /// Handle to the object `name`. If there is no object with this name (as on the first boot),
-/// inserts the value returned by `f` first; `f` only runs in that case, and `Ok(None)` means it
-/// did not fit, as for [`insert`].
+/// inserts the value returned by `f` first; `f` only runs in that case, and `Ok(None)` or
+/// [`Error::TooBig`] mean it did not fit, as for [`insert`].
 ///
 /// `T` must be the type the object was inserted with.
 pub fn get_or_insert_with<T: Storable, B: Backend>(
@@ -205,8 +209,8 @@ pub fn with<T: Storable, R, B: Backend>(
 /// the next [`flush`].
 ///
 /// Returns `Ok(None)` without running `f` if a flush has the storage and the object is not in
-/// RAM, or if the changes not flushed yet leave no room for this object (see
-/// [RAM budget](TierMem#ram-budget)).
+/// RAM, or if the changes not flushed yet leave no room for this object, and [`Error::TooBig`]
+/// if it is bigger than the whole budget (see [RAM budget](TierMem#ram-budget)).
 pub fn with_mut<T: Storable, R, B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
     handle: &Handle<T>,
@@ -227,8 +231,9 @@ pub fn usage<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Usage {
 /// removals. Returns `Ok(None)` if another flush has the storage (this one preempted it).
 ///
 /// Each object modified when it starts is written once, so it ends even if an interrupt keeps
-/// modifying objects. It stops at the first error: what is not written stays in RAM for the next
-/// flush.
+/// modifying objects. An object that fails to write stays in RAM for the next flush, and the
+/// others and the names are still written, so that one object failing at every flush does not
+/// block them: the first error is returned at the end.
 pub fn flush<B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
 ) -> Result<Option<()>, Error<B::Error>> {

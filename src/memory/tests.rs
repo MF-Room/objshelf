@@ -338,8 +338,22 @@ fn an_object_over_the_budget_stays_readable() {
         assert_eq!(with(&mut mem, &big, |b| b.0.len()).unwrap().unwrap(), 200);
         assert!(is_cached(&mem, &big));
     }
-    // But it cannot be modified.
-    assert!(matches!(with_mut(&mut mem, &big, |_| ()), Ok(None)));
+    // But it can never become modified, as no flush can make room for it.
+    let mut ran = false;
+    let too_big = with_mut(&mut mem, &big, |_| ran = true);
+    assert!(matches!(too_big, Err(Error::TooBig)));
+    assert!(!ran);
+    let too_big = insert(&mut mem, "other", Blob(vec![7; 200]));
+    assert!(matches!(too_big, Err(Error::TooBig)));
+
+    // An object can grow over the budget while modified, then it is too big.
+    let small = insert(&mut mem, "small", Blob(vec![])).unwrap().unwrap();
+    with_mut(&mut mem, &small, |b| b.0.resize(100, 0))
+        .unwrap()
+        .unwrap();
+    flush(&mut mem).unwrap().unwrap();
+    let too_big = with_mut(&mut mem, &small, |_| ());
+    assert!(matches!(too_big, Err(Error::TooBig)));
 }
 
 #[test]
@@ -359,6 +373,31 @@ fn a_failed_flush_keeps_the_changes() {
     assert_eq!(with(&mut mem, &a, |a| *a).unwrap().unwrap(), 10);
     assert!(mem.core.directory_modified);
     assert_eq!(mem.core.removed, [b.id]);
+}
+
+#[test]
+fn an_object_that_fails_to_write_does_not_block_the_others() {
+    let mut mem = mount(Flash::new(8), 16 * 1024);
+    let a = insert(&mut mem, "a", 1u32).unwrap().unwrap();
+    flush(&mut mem).unwrap().unwrap();
+    // Bigger than the flash: its write fails at every flush.
+    let big = insert(&mut mem, "big", Blob(vec![0; 6000]))
+        .unwrap()
+        .unwrap();
+    with_mut(&mut mem, &a, |a| *a = 10).unwrap().unwrap();
+    let b = insert(&mut mem, "b", 2u32).unwrap().unwrap();
+    let flushed = flush(&mut mem);
+    assert!(matches!(flushed, Err(Error::Backend(NorError::NoSpace))));
+    assert!(mem.core.cache[&big.id].modified);
+    assert_eq!(mem.core.modified_bytes, mem.core.cache[&big.id].size);
+
+    // The mount drops the name of `big`, stored without it.
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(list(&mut mem), ["a", "b"]);
+    assert_eq!(with(&mut mem, &a, |a| *a).unwrap().unwrap(), 10);
+    assert_eq!(with(&mut mem, &b, |b| *b).unwrap().unwrap(), 2);
+    // The directory, `a` and `b`.
+    assert_eq!(usage(&mut mem).objects, 3);
 }
 
 #[test]
