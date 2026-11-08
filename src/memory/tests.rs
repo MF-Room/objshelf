@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::object;
 use crate::backend::Backend;
-use crate::backend::nor::mock::{Cut, MockFlash};
+use crate::backend::nor::mock::{Cut, MockError, MockFlash};
 use crate::backend::nor::{NorBackend, NorConfig, NorError};
 use crate::{
     Error, Handle, Mutex, Storable, TierMem, flush, flush_object, get, get_or_insert_with, insert,
@@ -590,6 +590,72 @@ fn power_cut_during_flush() {
             break;
         }
     }
+}
+
+/// The names, values and object count a mount finds, all objects being `u32`.
+fn contents(mem: &mut Mem) -> (Vec<(String, u32)>, usize) {
+    let names = list(mem);
+    let read = |name: String| {
+        let handle: Handle<u32> = get(mem, &name).unwrap();
+        let value = with(mem, &handle, |v| *v).unwrap().unwrap();
+        (name, value)
+    };
+    let values = names.into_iter().map(read).collect();
+    (values, usage(mem).objects)
+}
+
+#[test]
+fn power_cut_during_mount() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    insert(&mut mem, "x", 1u32).unwrap().unwrap();
+    insert(&mut mem, "y", 2u32).unwrap().unwrap();
+    flush(&mut mem).unwrap().unwrap();
+    let flash = power_cut(mem);
+    let mut cut_mounts = 0;
+    for flush_op in 0.. {
+        // A flush cut at each of its operations: the next mount marks stale pages obsolete,
+        // removes the objects without a name, and drops the names without an object.
+        let cut = Flash::with_data(flash.data.clone()).cut_at(flush_op, Cut::FirstHalf);
+        let mut mem = mount(cut, CACHE);
+        insert(&mut mem, "a", 3u32).unwrap().unwrap();
+        let x: Handle<u32> = get(&mut mem, "x").unwrap();
+        with_mut(&mut mem, &x, |x| *x = 10).unwrap().unwrap();
+        let y: Handle<u32> = get(&mut mem, "y").unwrap();
+        remove(&mut mem, y).unwrap();
+        let done = matches!(flush(&mut mem), Ok(Some(())));
+        let left = power_cut(mem).data;
+        let expected = contents(&mut mount(Flash::with_data(left.clone()), CACHE));
+
+        // That mount cut at each of its operations: the next one finds the same.
+        for cut in [Cut::FirstHalf, Cut::SecondHalf] {
+            for mount_op in 0.. {
+                let copy = Arc::new(StdMutex::new(Vec::new()));
+                let flash = Flash::with_data(left.clone())
+                    .cut_at(mount_op, cut)
+                    .copy_on_cut(copy.clone());
+                let at = format!("flush cut at {flush_op}, mount cut at {mount_op} ({cut:?})");
+                match Mem::mount(config(flash), CACHE, || {}) {
+                    // Done before the cut.
+                    Ok(mut mem) => {
+                        assert_eq!(contents(&mut mem), expected, "{at}");
+                        break;
+                    }
+                    Err(error) => {
+                        let power_cut = Error::Backend(NorError::Flash(MockError::PowerCut));
+                        assert_eq!(format!("{error:?}"), format!("{power_cut:?}"), "{at}");
+                    }
+                }
+                cut_mounts += 1;
+                let after = copy.lock().unwrap().clone();
+                let mut mem = mount(Flash::with_data(after), CACHE);
+                assert_eq!(contents(&mut mem), expected, "{at}");
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    assert!(cut_mounts > 0, "some mounts write");
 }
 
 #[test]

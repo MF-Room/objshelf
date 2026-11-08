@@ -1,9 +1,11 @@
 //! RAM flash for the tests, with power-cut injection.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
+use std::sync::Mutex;
 
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
@@ -46,6 +48,8 @@ pub(crate) struct MockFlash<const ERASE_SIZE: usize> {
     dead: bool,
     /// Runs at the start of each program operation, as an interrupt during a write.
     pub(crate) on_write: Option<Box<dyn FnMut() + Send>>,
+    /// Gets a copy of the data when the power is cut (see `copy_on_cut`).
+    left: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
@@ -61,12 +65,20 @@ impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
             cut: None,
             dead: false,
             on_write: None,
+            left: None,
         }
     }
 
     /// Cuts the power during program or erase operation number `op` (0-based).
     pub(crate) fn cut_at(mut self, op: usize, cut: Cut) -> Self {
         self.cut = Some((op, cut));
+        self
+    }
+
+    /// Copies the data to `left` when the power is cut, as the flash is lost with a mount that
+    /// fails.
+    pub(crate) fn copy_on_cut(mut self, left: Arc<Mutex<Vec<u8>>>) -> Self {
+        self.left = Some(left);
         self
     }
 
@@ -89,6 +101,17 @@ impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Ends an operation: `PowerCut` if it was cut, after copying the data to `left`.
+    fn end(&self, cut: Option<Cut>) -> Result<(), MockError> {
+        if cut.is_none() {
+            return Ok(());
+        }
+        if let Some(left) = &self.left {
+            left.lock().unwrap().clone_from(&self.data);
+        }
+        Err(MockError::PowerCut)
     }
 
     fn check(&self, offset: u32, len: usize) -> Result<Range<usize>, MockError> {
@@ -145,7 +168,7 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
         let range = self.check(from, (to - from) as usize)?;
         let cut = self.next_op()?;
         self.data[part(range, cut)].fill(0xFF);
-        cut.map_or(Ok(()), |_| Err(MockError::PowerCut))
+        self.end(cut)
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
@@ -167,6 +190,6 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
         for at in part(range.clone(), cut) {
             self.data[at] &= bytes[at - range.start];
         }
-        cut.map_or(Ok(()), |_| Err(MockError::PowerCut))
+        self.end(cut)
     }
 }

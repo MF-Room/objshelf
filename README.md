@@ -214,7 +214,6 @@ Requirements, guarantees, time and space complexity: module documentation in
   never erased), an erase count kept across a sector header lost to an interrupted erase (it restarts
   at 0), a lifetime estimate for the expected write rate.
 - [ ] Format version in the sector header, migration of the on-flash format
-- [ ] Mount time: it reads the whole region. Bound it, or persist a checkpoint of the index
 - [ ] Edge cases:
   - after a flash error, the RAM state may not match the flash: define the rule (remount?)
   - a page that decays after its write (weak bits after a cut, bit rot) only shows up as `Corrupt` on
@@ -226,7 +225,6 @@ Requirements, guarantees, time and space complexity: module documentation in
   - limits: at most 65536 pages in the region (16 MiB with 256-byte pages), `u16` pages per object,
     `u32` version counter (wraps after 4 billion writes)
   - first use of a fresh chip erases each sector when it is first opened (one erase per sector)
-  - power cut during mount, which can write (stale pages marked obsolete): not tested yet
 - [x] Implement `TierMem` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, directory
   object (id 0), LRU read cache with a RAM budget, changes kept in RAM until a flush
 - [x] RAM accounting: an object counts its heap with `get-size2`, spare capacity included, instead of a
