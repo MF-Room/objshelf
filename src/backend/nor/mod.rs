@@ -24,6 +24,9 @@
 //! - A `write` or `remove` is on flash when it returns: nothing is buffered.
 //! - Each object is updated atomically. There are no transactions over several objects.
 //! - After a power cut at any point, mount restores a consistent state.
+//! - Each sector header holds the version of the on-flash format: mount fails with
+//!   [`NorError::UnsupportedFormat`] on a sector of another version, instead of erasing it as
+//!   unformatted.
 //!
 //! # Time
 //!
@@ -78,7 +81,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{Backend, Usage};
 use crate::ObjectId;
 use layout::{
-    MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE, PageHeader, SectorHeader, is_blank, is_obsolete,
+    FORMAT_VERSION, MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE, PageHeader, SectorHeader, is_blank,
+    is_obsolete,
 };
 
 /// Free sectors kept so garbage collection always has room to relocate live pages.
@@ -107,6 +111,9 @@ pub enum NorError<E> {
     Corrupt,
     /// The value could not be serialized or deserialized.
     Serialization(postcard::Error),
+    /// A sector holds another version of the on-flash format, the one given, written by other
+    /// firmware: the mount fails without erasing anything.
+    UnsupportedFormat(u16),
 }
 
 /// Current version of an object and its pages, in order.
@@ -356,6 +363,9 @@ impl<F: NorFlash> NorBackend<F> {
             let Some(header) = SectorHeader::decode(&bytes) else {
                 continue;
             };
+            if header.version != FORMAT_VERSION {
+                return Err(NorError::UnsupportedFormat(header.version));
+            }
             self.sectors[sector].erase_count = header.erase_count;
             if header.retired {
                 continue;

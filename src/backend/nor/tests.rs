@@ -1,6 +1,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use crc::{CRC_32_ISO_HDLC, Crc};
 use serde::{Deserialize, Serialize};
 
 use super::mock::{Cut, MockError, MockFlash};
@@ -184,6 +185,30 @@ fn invalid_config() {
         range: 512..4096,
     });
     assert!(matches!(result, Err(NorError::InvalidConfig)));
+}
+
+#[test]
+fn another_format_version_fails_the_mount() {
+    let mut backend = mount(SmallFlash::new(4));
+    write(&mut backend, 1, &bytes(1, 300));
+    let mut data = backend.flash.data;
+    // Firmware with format version 2 rewrote the sector headers, keeping them valid.
+    let mut headers = 0;
+    for header in data.chunks_mut(1024) {
+        if header[..2] == 0x5453u16.to_le_bytes() {
+            header[2..4].copy_from_slice(&2u16.to_le_bytes());
+            let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&header[..8]);
+            header[8..12].copy_from_slice(&crc.to_le_bytes());
+            headers += 1;
+        }
+    }
+    assert!(headers > 0);
+
+    // A write or erase would hit the cut first: the mount fails without writing anything.
+    let flash = SmallFlash::with_data(data).cut_at(0, Cut::FirstHalf);
+    let range = 0..flash.data.len() as u32;
+    let mounted = NorBackend::mount(NorConfig { flash, range });
+    assert!(matches!(mounted, Err(NorError::UnsupportedFormat(2))));
 }
 
 enum Op {

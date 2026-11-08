@@ -26,7 +26,11 @@ pub(super) const PAYLOAD_SIZE: usize = MARKER_OFFSET - PAGE_HEADER_SIZE;
 // `0x54` is ASCII `T`, for tiermem, and `0x53` is `S`, for sector. Neither magic is all `0xFF`
 // (erased) or all `0x00`, and a CRC follows each of them.
 const PAGE_MAGIC: u16 = 0x5401;
-const SECTOR_MAGIC: u32 = 0x5453_0001;
+const SECTOR_MAGIC: u16 = 0x5453;
+
+/// Version of the on-flash format, in each sector header. Mount fails on a sector of another
+/// version instead of erasing it as unformatted.
+pub(super) const FORMAT_VERSION: u16 = 1;
 const SECTOR_HEADER_SIZE: usize = 12;
 
 /// Header of a data page.
@@ -98,13 +102,16 @@ impl PageHeader {
 ///
 /// ```text
 /// offset  size  field
-/// 0       4     magic        SECTOR_MAGIC
+/// 0       2     magic        SECTOR_MAGIC
+/// 2       2     version      FORMAT_VERSION when written by this code
 /// 4       4     erase_count
 /// 8       4     crc          CRC32 of bytes 0..8
 /// 255     1     retired      0xFF until the sector is about to be erased
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SectorHeader {
+    /// Version of the on-flash format of the sector.
+    pub(super) version: u16,
     pub(super) erase_count: u32,
     /// Set before the sector is erased: if the erase is cut, the sector is erased again.
     pub(super) retired: bool,
@@ -114,19 +121,22 @@ impl SectorHeader {
     /// Bytes to program right after the erase.
     pub(super) fn encode(erase_count: u32) -> [u8; SECTOR_HEADER_SIZE] {
         let mut bytes = [0; SECTOR_HEADER_SIZE];
-        bytes[0..4].copy_from_slice(&SECTOR_MAGIC.to_le_bytes());
+        bytes[0..2].copy_from_slice(&SECTOR_MAGIC.to_le_bytes());
+        bytes[2..4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         bytes[4..8].copy_from_slice(&erase_count.to_le_bytes());
         let crc = crc32(&[&bytes[..8]]);
         bytes[8..12].copy_from_slice(&crc.to_le_bytes());
         bytes
     }
 
-    /// Header of a sector, or `None` if it has none (never formatted, erase or header write cut).
+    /// Header of a sector, of any format version, or `None` if it has none (never formatted,
+    /// erase or header write cut).
     pub(super) fn decode(page: &[u8; PAGE_SIZE]) -> Option<Self> {
-        if le32(page, 0) != SECTOR_MAGIC || crc32(&[&page[..8]]) != le32(page, 8) {
+        if le16(page, 0) != SECTOR_MAGIC || crc32(&[&page[..8]]) != le32(page, 8) {
             return None;
         }
         Some(Self {
+            version: le16(page, 2),
             erase_count: le32(page, 4),
             retired: page[MARKER_OFFSET] != 0xFF,
         })
@@ -191,6 +201,7 @@ mod tests {
         let mut page = [0xFF; PAGE_SIZE];
         page[..SECTOR_HEADER_SIZE].copy_from_slice(&SectorHeader::encode(5));
         let header = SectorHeader {
+            version: FORMAT_VERSION,
             erase_count: 5,
             retired: false,
         };

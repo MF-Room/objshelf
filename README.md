@@ -191,7 +191,9 @@ in [`src/memory`](src/memory/mod.rs).
 (chips with internal ECC are not supported for now). Every operation blocks until done.
 
 * Objects are serialized with postcard and split in 256-byte pages (20-byte header, 235-byte payload,
-  1-byte obsolete marker). Page 0 of each sector holds a sector header with its erase count.
+  1-byte obsolete marker). Page 0 of each sector holds a sector header with the format version and the
+  erase count. A sector of another format version makes mount fail with `UnsupportedFormat`, instead of
+  being erased as unformatted.
 * RAM index: `ObjectId` → current version and page list (`hashbrown::HashMap`, needs a heap).
 * Each write gets a new global version. A version counts only once all its pages are on flash, so a power
   cut leaves either the old or the new value. Replaced and removed pages are then marked obsolete.
@@ -213,7 +215,8 @@ Requirements, guarantees, time and space complexity: module documentation in
   the least worn sector. Missing: static wear leveling (sectors holding data that never changes are
   never erased), an erase count kept across a sector header lost to an interrupted erase (it restarts
   at 0), a lifetime estimate for the expected write rate.
-- [ ] Format version in the sector header, migration of the on-flash format
+- [x] Format version in the sector header: mount fails on another version instead of erasing it
+- [ ] Migration of the on-flash format to a new version
 - [ ] Edge cases:
   - after a flash error, the RAM state may not match the flash: define the rule (remount?)
   - a page that decays after its write (weak bits after a cut, bit rot) only shows up as `Corrupt` on
