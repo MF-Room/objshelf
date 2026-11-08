@@ -14,8 +14,8 @@ use crate::backend::Backend;
 use crate::backend::nor::mock::{Cut, MockError, MockFlash};
 use crate::backend::nor::{NorBackend, NorConfig, NorError};
 use crate::{
-    Error, Handle, Mutex, Storable, TierMem, flush, flush_object, get, get_or_insert_with, insert,
-    list, remove, usage, with, with_mut,
+    Error, Handle, Mutex, ObjectId, Storable, TierMem, flush, flush_object, get,
+    get_or_insert_with, insert, list, remove, usage, with, with_mut,
 };
 
 type Flash = MockFlash<1024>;
@@ -202,8 +202,7 @@ fn insert_and_remove_reach_the_flash_on_flush() {
     assert_eq!(list(&mut mem), ["b"]);
     let b: Handle<Blob> = get(&mut mem, "b").unwrap();
     assert_eq!(with(&mut mem, &b, |b| b.0.clone()).unwrap().unwrap(), [2]);
-    // The directory and `b`.
-    assert_eq!(usage(&mut mem).objects, 2);
+    assert_eq!(usage(&mut mem).objects, 1);
 }
 
 #[test]
@@ -260,14 +259,12 @@ fn a_new_object_flushed_alone_survives_a_power_cut() {
     let a = insert(&mut mem, "a", 1u32).unwrap().unwrap();
     insert(&mut mem, "b", 2u32).unwrap().unwrap();
     flush_object(&mut mem, &a).unwrap().unwrap();
-    // The names were stored with the one of `b`, which was not: the mount drops it.
+    // `a` was stored with its name, `b` not at all.
     let mut mem = mount(power_cut(mem), CACHE);
     assert_eq!(list(&mut mem), ["a"]);
     assert_eq!(with(&mut mem, &a, |a| *a).unwrap().unwrap(), 1);
-    // The directory and `a`.
-    assert_eq!(usage(&mut mem).objects, 2);
+    assert_eq!(usage(&mut mem).objects, 1);
 
-    // Without a power cut, the next flush writes `b`, whose name is already stored.
     let b = insert(&mut mem, "b", 2u32).unwrap().unwrap();
     insert(&mut mem, "c", 3u32).unwrap().unwrap();
     flush_object(&mut mem, &b).unwrap().unwrap();
@@ -401,8 +398,7 @@ fn a_failed_flush_keeps_the_changes() {
     assert!(mem.core.cache[&a.id].modified);
     assert_eq!(mem.core.modified_bytes, mem.core.cache[&a.id].size);
     assert_eq!(with(&mut mem, &a, |a| *a).unwrap().unwrap(), 10);
-    assert!(mem.core.directory_modified);
-    assert_eq!(mem.core.removed, [b.id]);
+    assert_eq!(mem.core.removed, [(b.id, "b".to_string())]);
 }
 
 #[test]
@@ -421,13 +417,57 @@ fn an_object_that_fails_to_write_does_not_block_the_others() {
     assert!(mem.core.cache[&big.id].modified);
     assert_eq!(mem.core.modified_bytes, mem.core.cache[&big.id].size);
 
-    // The mount drops the name of `big`, stored without it.
     let mut mem = mount(power_cut(mem), CACHE);
     assert_eq!(list(&mut mem), ["a", "b"]);
     assert_eq!(with(&mut mem, &a, |a| *a).unwrap().unwrap(), 10);
     assert_eq!(with(&mut mem, &b, |b| *b).unwrap().unwrap(), 2);
-    // The directory, `a` and `b`.
-    assert_eq!(usage(&mut mem).objects, 3);
+    assert_eq!(usage(&mut mem).objects, 2);
+}
+
+#[test]
+fn a_replaced_object_stays_until_its_successor_is_written() {
+    let mut mem = mount(Flash::new(8), 16 * 1024);
+    let old = insert(&mut mem, "a", Blob(vec![1])).unwrap().unwrap();
+    flush(&mut mem).unwrap().unwrap();
+    // The new `a` is bigger than the flash: its write fails, so the old one is not removed.
+    remove(&mut mem, old).unwrap();
+    let new = insert(&mut mem, "a", Blob(vec![2; 6000])).unwrap().unwrap();
+    let flushed = flush(&mut mem);
+    assert!(matches!(flushed, Err(Error::Backend(NorError::NoSpace))));
+    assert_eq!(mem.core.removed, [(old.id, "a".to_string())]);
+    let flash = mem.core.backend.as_mut().unwrap().flash_mut();
+    let mut after_cut = mount(Flash::with_data(flash.data.clone()), CACHE);
+    assert_eq!(
+        contents_of::<Blob>(&mut after_cut),
+        (vec![("a".into(), Blob(vec![1]))], 1)
+    );
+
+    // Once the new `a` is written, the old one goes.
+    with_mut(&mut mem, &new, |b| b.0.truncate(1))
+        .unwrap()
+        .unwrap();
+    flush(&mut mem).unwrap().unwrap();
+    assert!(mem.core.removed.is_empty());
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(
+        contents_of::<Blob>(&mut mem),
+        (vec![("a".into(), Blob(vec![2]))], 1)
+    );
+}
+
+#[test]
+fn the_mount_keeps_the_newer_of_two_objects_with_the_same_name() {
+    // As a flush cut between the write of a new `a` and the removal of the old one leaves it.
+    let mut backend = NorBackend::mount(config(Flash::new(8))).unwrap();
+    backend.write(ObjectId(3), "a", &1u32).unwrap();
+    backend.write(ObjectId(7), "a", &2u32).unwrap();
+    backend.write(ObjectId(5), "b", &3u32).unwrap();
+    let mut mem = mount(Flash::with_data(backend.into_flash().data), CACHE);
+    let expected = vec![("a".into(), 2), ("b".into(), 3)];
+    assert_eq!(contents(&mut mem), (expected, 2));
+    // A new object gets a higher id than every stored one.
+    let c = insert(&mut mem, "c", 4u32).unwrap().unwrap();
+    assert_eq!(c.id, ObjectId(8));
 }
 
 #[test]
@@ -469,7 +509,7 @@ fn busy_only_while_a_flush_has_the_storage() {
     let seen = seen.lock().unwrap();
     assert!(!seen.is_empty());
     assert!(
-        seen.iter().all(|&s| s == (Some(1), None, None, 4)),
+        seen.iter().all(|&s| s == (Some(1), None, None, 3)),
         "{seen:?}"
     );
 
@@ -551,7 +591,17 @@ fn remove_during_flush() {
     // Its removal was written in the same flush.
     let mut mem = mount(flash, CACHE);
     assert_eq!(list(&mut mem), ["b"]);
-    assert_eq!(usage(&mut mem).objects, 2);
+    assert_eq!(usage(&mut mem).objects, 1);
+}
+
+/// Inserts `a`, replaces `x` with a new object of the same name, and removes `y`.
+fn replace_x(mem: &mut Mem) {
+    insert(mem, "a", 3u32).unwrap().unwrap();
+    let x: Handle<u32> = get(mem, "x").unwrap();
+    remove(mem, x).unwrap();
+    insert(mem, "x", 10u32).unwrap().unwrap();
+    let y: Handle<u32> = get(mem, "y").unwrap();
+    remove(mem, y).unwrap();
 }
 
 #[test]
@@ -561,47 +611,53 @@ fn power_cut_during_flush() {
     insert(&mut mem, "y", 2u32).unwrap().unwrap();
     flush(&mut mem).unwrap().unwrap();
     let flash = power_cut(mem);
+    let mut two_x = false;
     for op in 0.. {
         let cut = Flash::with_data(flash.data.clone()).cut_at(op, Cut::FirstHalf);
         let mut mem = mount(cut, CACHE);
-        insert(&mut mem, "a", 3u32).unwrap().unwrap();
-        let y: Handle<u32> = get(&mut mem, "y").unwrap();
-        remove(&mut mem, y).unwrap();
+        replace_x(&mut mem);
         let done = matches!(flush(&mut mem), Ok(Some(())));
+        let left = power_cut(mem).data;
+        let stored = NorBackend::mount(config(Flash::with_data(left.clone()))).unwrap();
+        let stored = stored.usage().objects;
 
-        // Before or after, never in between: the mount removed the objects without a name.
-        let mut mem = mount(power_cut(mem), CACHE);
-        let names = list(&mut mem);
-        let (name, value) = if names == ["a", "x"] {
-            ("a", 3)
-        } else {
-            assert_eq!(names, ["x", "y"], "cut at {op}");
-            ("y", 2)
-        };
-        let handle: Handle<u32> = get(&mut mem, name).unwrap();
-        assert_eq!(
-            with(&mut mem, &handle, |v| *v).unwrap().unwrap(),
-            value,
-            "cut at {op}"
+        // Each object as it was or as written, the new ones before the removals. `x` is the old
+        // or the new one, never none, and the mount removed the old one if both were left.
+        let (found, objects) = contents(&mut mount(Flash::with_data(left), CACHE));
+        let value = |name: &str| found.iter().find(|(n, _)| n == name).map(|&(_, v)| v);
+        assert!(matches!(value("x"), Some(1 | 10)), "cut at {op}: {found:?}");
+        assert!(
+            matches!(value("a"), None | Some(3)),
+            "cut at {op}: {found:?}"
         );
-        assert_eq!(usage(&mut mem).objects, 3, "cut at {op}");
+        if value("y").is_none() {
+            assert_eq!(value("a"), Some(3), "cut at {op}");
+            assert_eq!(value("x"), Some(10), "cut at {op}");
+        }
+        assert_eq!(objects, found.len(), "cut at {op}");
+        two_x |= stored > found.len();
         if done {
-            assert_eq!(names, ["a", "x"]);
+            assert_eq!(found, [("a".into(), 3), ("x".into(), 10)]);
             break;
         }
     }
+    assert!(two_x, "some cut left two objects named x");
 }
 
-/// The names, values and object count a mount finds, all objects being `u32`.
-fn contents(mem: &mut Mem) -> (Vec<(String, u32)>, usize) {
+/// The names, values and object count a mount finds, all objects being of type `T`.
+fn contents_of<T: Storable + Clone>(mem: &mut Mem) -> (Vec<(String, T)>, usize) {
     let names = list(mem);
     let read = |name: String| {
-        let handle: Handle<u32> = get(mem, &name).unwrap();
-        let value = with(mem, &handle, |v| *v).unwrap().unwrap();
+        let handle: Handle<T> = get(mem, &name).unwrap();
+        let value = with(mem, &handle, T::clone).unwrap().unwrap();
         (name, value)
     };
     let values = names.into_iter().map(read).collect();
     (values, usage(mem).objects)
+}
+
+fn contents(mem: &mut Mem) -> (Vec<(String, u32)>, usize) {
+    contents_of(mem)
 }
 
 #[test]
@@ -613,15 +669,11 @@ fn power_cut_during_mount() {
     let flash = power_cut(mem);
     let mut cut_mounts = 0;
     for flush_op in 0.. {
-        // A flush cut at each of its operations: the next mount marks stale pages obsolete,
-        // removes the objects without a name, and drops the names without an object.
+        // A flush cut at each of its operations: the next mount marks stale pages obsolete, and
+        // removes the old `x` if the new one is stored too.
         let cut = Flash::with_data(flash.data.clone()).cut_at(flush_op, Cut::FirstHalf);
         let mut mem = mount(cut, CACHE);
-        insert(&mut mem, "a", 3u32).unwrap().unwrap();
-        let x: Handle<u32> = get(&mut mem, "x").unwrap();
-        with_mut(&mut mem, &x, |x| *x = 10).unwrap().unwrap();
-        let y: Handle<u32> = get(&mut mem, "y").unwrap();
-        remove(&mut mem, y).unwrap();
+        replace_x(&mut mem);
         let done = matches!(flush(&mut mem), Ok(Some(())));
         let left = power_cut(mem).data;
         let expected = contents(&mut mount(Flash::with_data(left.clone()), CACHE));

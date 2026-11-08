@@ -9,12 +9,12 @@ use crate::{ObjectId, Storable};
 
 /// A cached object, its type erased.
 pub(super) trait Cached<B: Backend>: Any + Send {
-    fn write(&self, backend: &mut B, id: ObjectId) -> Result<(), B::Error>;
+    fn write(&self, backend: &mut B, id: ObjectId, name: &str) -> Result<(), B::Error>;
 }
 
 impl<B: Backend, T: Storable> Cached<B> for T {
-    fn write(&self, backend: &mut B, id: ObjectId) -> Result<(), B::Error> {
-        backend.write(id, self)
+    fn write(&self, backend: &mut B, id: ObjectId, name: &str) -> Result<(), B::Error> {
+        backend.write(id, name, self)
     }
 }
 

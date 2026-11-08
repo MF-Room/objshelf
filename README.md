@@ -138,8 +138,8 @@ owned `TierMem`.
 | `with(mem, &handle, \|v\| ...)` | Runs the closure on the object and returns its result. Reads the object from flash first if it is not in RAM. |
 | `with_mut(mem, &handle, \|v\| ...)` | Same, with mutable access. The change stays in RAM until the next flush. |
 | `usage(mem)` | Space of the backend: capacity, used, free, reclaimable by garbage collection, number of objects. |
-| `flush(mem)` | Writes the changes to the flash: changed and new objects, then the names, then the removals. |
-| `flush_object(mem, &handle)` | Writes this object if it changed, then the names and removals if there are any (a new object needs its name stored). The other changed objects stay in RAM. |
+| `flush(mem)` | Writes the changes to the flash: changed and new objects, each with its name, then the removals. |
+| `flush_object(mem, &handle)` | Writes this object if it changed, with its name. The other changes, removals included, stay in RAM. |
 
 `with`, `with_mut`, `insert`, `get_or_insert_with`, `flush` and `flush_object` return `Ok(None)`, having
 done nothing, when the call can't be done now:
@@ -152,8 +152,8 @@ done nothing, when the call can't be done now:
 
 The errors are `NotFound`, `AlreadyExists`, `WrongType` (the handle's type is not the object's), `TooBig`
 (the object alone is bigger than the RAM budget, so `with_mut` and `insert` can never take it) and `Backend`
-(the flash failed). When an object fails to write, `flush` still writes the others and the names, and
-returns the first error: the object stays in RAM for the next flush.
+(the flash failed). When an object fails to write, `flush` still writes the others and does the removals,
+and returns the first error: the object stays in RAM for the next flush.
 
 ## How it works
 
@@ -176,10 +176,14 @@ returns the first error: the object stays in RAM for the next flush.
   room for it.
 * **Durability.** Changes, inserts and removals reach the flash on `flush` or `unmount`, or on
   `flush_object` for one object: a reset loses the rest. A power cut during a flush leaves each object
-  either as it was or as written, and the next mount cleans up. Objects that must stay consistent with
+  either as it was or as written, with its name. An object replaced by a new one of the same name
+  (`remove`, then `insert`) stays on flash until the new one is written, and mount keeps the newer one if
+  both are left: the name never ends up with no object or two. Objects that must stay consistent with
   each other should be flushed together, with `flush`.
-* **Names and types.** The names are kept in RAM and rewritten whole by the flush after an `insert` or a
-  `remove`: keep them short. An object must be read with the type it was inserted with. A cached object of
+* **Names and types.** Each object is stored with its name, and mount reads the names from the objects:
+  there is no directory to lose, and an `insert` or a `remove` writes only that object. The name is
+  written again with each write of its object: keep names short. An object must be read with the type
+  it was inserted with. A cached object of
   another type gives `WrongType`, but the backend does not check types yet (see TODO).
 
 Details: the `TierMem` documentation in [`src/api.rs`](src/api.rs), the public API. The engine behind it is
@@ -190,7 +194,7 @@ in [`src/memory`](src/memory/mod.rs).
 `src/backend/nor`: object store on any blocking `embedded_storage::nor_flash::NorFlash` with 1-byte writes
 (chips with internal ECC are not supported for now). Every operation blocks until done.
 
-* Objects are serialized with postcard and split in 256-byte pages (20-byte header, 235-byte payload,
+* Objects are serialized with postcard, their name first, and split in 256-byte pages (20-byte header, 235-byte payload,
   1-byte obsolete marker). Page 0 of each sector holds a sector header with the format version and the
   erase count. A sector of another format version makes mount fail with `UnsupportedFormat`, instead of
   being erased as unformatted.
@@ -226,19 +230,19 @@ Requirements, guarantees, time and space complexity: module documentation in
   - peak RAM: `write` and `read` hold the whole serialized object, plus the page list
   - limits: at most 65536 pages in the region (16 MiB with 256-byte pages), `u16` pages per object,
     `u32` version counter (wraps after 4 billion writes)
-- [x] Implement `TierMem` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, directory
-  object (id 0), LRU read cache with a RAM budget, changes kept in RAM until a flush
+- [x] Implement `TierMem` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names
+  stored with the objects, LRU read cache with a RAM budget, changes kept in RAM until a flush
 - [x] RAM accounting: an object counts its heap with `get-size2`, spare capacity included, instead of a
   serialized-size estimate
 - [x] `Error::TooBig` from `with_mut` and `insert` for an object bigger than the whole RAM budget, instead
   of `None` forever
 - [x] A flush writes the other objects and the names when one object fails to write (for example with
   `NoSpace`), and returns the first error at the end, so one failing object does not block every write
-- [ ] The directory is a single point of failure: if it is lost (corrupted sector header), mount removes
-  every object
+- [x] Names stored with the objects instead of in a directory object, which was a single point of
+  failure (lost, mount removed every object) and was rewritten whole on every `insert` or `remove`
 - [ ] Type check on read: a stored type tag or schema hash in the backend, instead of a postcard error
   or a wrong decode
-- [ ] Max name length; the directory is rewritten whole on every change
+- [ ] Max name length (a name is written again with each write of its object)
 - [ ] Max object size, flash region used by tiermem
 - [ ] Schema versioning and migration of stored types
 - [x] Host tests with a simulated `NorFlash` (power cuts, two geometries), `cargo test` in CI

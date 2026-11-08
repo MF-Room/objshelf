@@ -2,13 +2,15 @@
 
 pub mod nor;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::ObjectId;
 
-/// Persistent store of serialized objects, addressed by `ObjectId`.
+/// Persistent store of serialized objects, addressed by `ObjectId`. Each object holds its name,
+/// written with it, so the names are stored nowhere else.
 ///
 /// One operation runs at a time (`&mut self`), blocking until done.
 // `'static` because `TierMem` erases the types of the objects it caches, which names the backend.
@@ -21,11 +23,21 @@ pub trait Backend: Sized + 'static {
     /// Opens the storage and rebuilds the backend's state from what it holds.
     fn mount(config: Self::Config) -> Result<Self, Self::Error>;
 
-    /// Stores `value` under `id`, replacing any previous value. It is durable when this returns.
-    fn write<T: Serialize>(&mut self, id: ObjectId, value: &T) -> Result<(), Self::Error>;
+    /// Stores `value` under `id`, with its `name`, replacing any previous value. It is durable when
+    /// this returns. The name and the value are written at once: an object is never stored without
+    /// its name.
+    fn write<T: Serialize>(
+        &mut self,
+        id: ObjectId,
+        name: &str,
+        value: &T,
+    ) -> Result<(), Self::Error>;
 
     /// Reads the value stored under `id`. `T` must be the type it was written with.
     fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, Self::Error>;
+
+    /// Reads the name stored with the object `id`, without its value.
+    fn name(&mut self, id: ObjectId) -> Result<String, Self::Error>;
 
     /// Removes the object `id`. The removal is durable when this returns.
     fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error>;

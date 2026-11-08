@@ -94,15 +94,16 @@ use crate::{Error, Handle, Storable};
 /// # Durability
 ///
 /// Changes reach the backend on [`flush`], [`flush_object`] for that object, or
-/// [`unmount`](Self::unmount): a reset loses the rest. A power cut during a flush leaves each
-/// object either as it was or as written, and the next mount cleans up the names and objects the
-/// flush left half done.
+/// [`unmount`](Self::unmount): a reset loses the rest. Each object is stored with its name. A
+/// power cut during a flush leaves each object either as it was or as written, with its name: an
+/// object replaced by a new one of the same name ([`remove`], then [`insert`]) stays until the new
+/// one is written, and the next mount keeps the newer one if both are left.
 pub struct TierMem<B: Backend> {
     pub(crate) core: Core<B>,
 }
 
 impl<B: Backend> TierMem<B> {
-    /// Mounts the backend and reads the name directory, blocking until done. Objects in RAM take
+    /// Mounts the backend and reads the names of the objects, blocking until done. Objects in RAM take
     /// about `cache_bytes`, and `on_full` is called when the changes not flushed yet fill them
     /// (see [RAM budget](Self#ram-budget)). It runs inside the lock: keep it short, as spawning
     /// the task that flushes. `|| {}` does nothing.
@@ -229,12 +230,12 @@ pub fn usage<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Usage {
     Locked(mem).usage()
 }
 
-/// Writes the changes to the backend: the modified and new objects, then the names, then the
+/// Writes the changes to the backend: the modified and new objects, each with its name, then the
 /// removals. Returns `Ok(None)` if another flush has the storage (this one preempted it).
 ///
 /// Each object modified when it starts is written once, so it ends even if an interrupt keeps
 /// modifying objects. An object that fails to write stays in RAM for the next flush, and the
-/// others and the names are still written, so that one object failing at every flush does not
+/// others and the removals are still done, so that one object failing at every flush does not
 /// block them: the first error is returned at the end.
 pub fn flush<B: Backend>(
     mem: &mut impl Mutex<T = TierMem<B>>,
@@ -242,9 +243,8 @@ pub fn flush<B: Backend>(
     Locked(mem).flush()
 }
 
-/// Writes the object of `handle` to the backend if it is modified, and the other modified objects
-/// stay in RAM. Then writes the names if they changed, as a new object needs its name stored, and
-/// the removals.
+/// Writes the object of `handle` to the backend if it is modified, with its name. The other
+/// changes, removals included, stay in RAM until [`flush`].
 ///
 /// Returns [`Error::NotFound`] if the object is removed, and `Ok(None)` if another flush has the
 /// storage, as [`flush`] does. Objects that must stay consistent with each other should be

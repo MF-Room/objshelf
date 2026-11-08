@@ -1,7 +1,7 @@
 //! Object store on NOR flash.
 //!
-//! Objects are serialized with postcard and split in 256-byte pages (see `layout`). Each write of
-//! an object gets a new global version, written to free pages. A version only counts once all its
+//! Objects are serialized with postcard, their name first, and split in 256-byte pages (see
+//! `layout`). Each write of an object gets a new global version, written to free pages. A version only counts once all its
 //! pages are on flash, so after a power cut an object holds either its old or its new value.
 //! Replaced and removed pages are marked obsolete. Garbage collection relocates the live pages of
 //! the sector with the most garbage, then erases it.
@@ -73,6 +73,7 @@ pub(crate) mod mock;
 #[cfg(test)]
 mod tests;
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Reverse;
@@ -229,6 +230,27 @@ impl<F: NorFlash> NorBackend<F> {
     fn mark_obsolete(&mut self, page: usize) -> Result<(), NorError<F::Error>> {
         let addr = self.page_addr(page) + MARKER_OFFSET as u32;
         self.program(addr, &[0])
+    }
+
+    /// Appends the payload of page `index` of the object `id` to `data`, once the page is checked.
+    fn read_payload(
+        &mut self,
+        id: ObjectId,
+        index: usize,
+        data: &mut Vec<u8>,
+    ) -> Result<(), NorError<F::Error>> {
+        let object = &self.objects[&id];
+        let (version, page) = (object.version, object.pages[index]);
+        let bytes = self.read_page(usize::from(page))?;
+        let header = PageHeader::decode(&bytes).ok_or(NorError::Corrupt)?;
+        if header.object_id != id.0
+            || header.version != version
+            || usize::from(header.index) != index
+        {
+            return Err(NorError::Corrupt);
+        }
+        data.extend_from_slice(header.payload(&bytes));
+        Ok(())
     }
 
     /// Marks the pages of a replaced or removed version obsolete.
@@ -498,8 +520,13 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
         Ok(backend)
     }
 
-    fn write<T: Serialize>(&mut self, id: ObjectId, value: &T) -> Result<(), Self::Error> {
-        let data = postcard::to_allocvec(value).map_err(NorError::Serialization)?;
+    fn write<T: Serialize>(
+        &mut self,
+        id: ObjectId,
+        name: &str,
+        value: &T,
+    ) -> Result<(), Self::Error> {
+        let data = postcard::to_allocvec(&(name, value)).map_err(NorError::Serialization)?;
         let count = data.len().div_ceil(PAYLOAD_SIZE).max(1);
         let header_count = u16::try_from(count).map_err(|_| NorError::NoSpace)?;
         self.ensure_space(count)?;
@@ -534,23 +561,30 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
     }
 
     fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, Self::Error> {
-        let object = self.objects.get(&id).ok_or(NorError::NotFound)?;
-        let version = object.version;
-        let pages = object.pages.clone();
-
-        let mut data = Vec::with_capacity(pages.len() * PAYLOAD_SIZE);
-        for (index, &page) in pages.iter().enumerate() {
-            let bytes = self.read_page(usize::from(page))?;
-            let header = PageHeader::decode(&bytes).ok_or(NorError::Corrupt)?;
-            if header.object_id != id.0
-                || header.version != version
-                || usize::from(header.index) != index
-            {
-                return Err(NorError::Corrupt);
-            }
-            data.extend_from_slice(header.payload(&bytes));
+        let count = self.objects.get(&id).ok_or(NorError::NotFound)?.pages.len();
+        let mut data = Vec::with_capacity(count * PAYLOAD_SIZE);
+        for index in 0..count {
+            self.read_payload(id, index, &mut data)?;
         }
-        postcard::from_bytes(&data).map_err(NorError::Serialization)
+        let (_name, value): (&str, T) =
+            postcard::from_bytes(&data).map_err(NorError::Serialization)?;
+        Ok(value)
+    }
+
+    /// Reads the pages of the object until its name is whole: the first one only, unless the name
+    /// is longer than about 230 bytes.
+    fn name(&mut self, id: ObjectId) -> Result<String, Self::Error> {
+        let count = self.objects.get(&id).ok_or(NorError::NotFound)?.pages.len();
+        let mut data = Vec::new();
+        for index in 0..count {
+            self.read_payload(id, index, &mut data)?;
+            match postcard::take_from_bytes::<&str>(&data) {
+                Ok((name, _)) => return Ok(name.into()),
+                Err(postcard::Error::DeserializeUnexpectedEnd) if index + 1 < count => {}
+                Err(error) => return Err(NorError::Serialization(error)),
+            }
+        }
+        unreachable!("an object has at least one page")
     }
 
     fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error> {

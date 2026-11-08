@@ -1,5 +1,5 @@
 //! The names of the objects, `insert` and `remove`. They change RAM only, inside the lock, and
-//! never wait: `flush` writes the objects, then the directory, then removes the removed objects
+//! never wait: `flush` writes the objects, each with its name, then removes the removed objects
 //! (`write.rs`).
 
 use alloc::string::{String, ToString};
@@ -42,7 +42,6 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
             let id = ObjectId(core.next_id);
             core.next_id += 1;
             core.directory.insert(name.to_string(), id);
-            core.directory_modified = true;
             core.cache(id, value, true);
             core.drop_clean(id);
             Ok(Some(id))
@@ -53,20 +52,24 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
     /// flush drops it once written (`write::write_back`).
     pub(crate) fn remove(&mut self, id: ObjectId) -> Result<(), Error<B::Error>> {
         self.lock(|core| {
-            if !core.is_named(id) {
-                return Err(Error::NotFound);
-            }
-            core.directory.retain(|_, &mut named| named != id);
-            core.directory_modified = true;
+            let name = core.name_of(id).ok_or(Error::NotFound)?.to_string();
+            core.directory.remove(&name);
             core.uncache(id);
-            core.removed.push(id);
+            core.removed.push((id, name));
             Ok(())
         })
     }
 }
 
 impl<B: Backend> Core<B> {
+    /// Name of the object `id`, `None` if it is removed.
+    pub(super) fn name_of(&self, id: ObjectId) -> Option<&str> {
+        let mut names = self.directory.iter();
+        let (name, _) = names.find(|&(_, &named)| named == id)?;
+        Some(name)
+    }
+
     pub(super) fn is_named(&self, id: ObjectId) -> bool {
-        self.directory.values().any(|&named| named == id)
+        self.name_of(id).is_some()
     }
 }

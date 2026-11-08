@@ -1,9 +1,11 @@
 use alloc::collections::BTreeMap;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crc::{CRC_32_ISO_HDLC, Crc};
 use serde::{Deserialize, Serialize};
 
+use super::layout::FORMAT_VERSION;
 use super::mock::{Cut, MockError, MockFlash};
 use super::{NorBackend, NorConfig, NorError};
 use crate::ObjectId;
@@ -22,8 +24,9 @@ fn reboot<const E: usize>(backend: NorBackend<MockFlash<E>>) -> NorBackend<MockF
     mount(MockFlash::with_data(backend.flash.data))
 }
 
+/// Writes `value` as the object `id`, named after its id.
 fn write<const E: usize, T: Serialize>(backend: &mut NorBackend<MockFlash<E>>, id: u32, value: &T) {
-    backend.write(ObjectId(id), value).unwrap();
+    backend.write(ObjectId(id), &id.to_string(), value).unwrap();
 }
 
 fn read<const E: usize>(backend: &mut NorBackend<MockFlash<E>>, id: u32) -> Option<Vec<u8>> {
@@ -61,6 +64,20 @@ fn round_trip_and_reboot() {
     assert_eq!(read(&mut backend, 2), Some(bytes(7, 1000)));
     backend.read::<()>(ObjectId(3)).unwrap();
     assert_eq!(read(&mut backend, 4), None);
+    for id in 1..=3 {
+        assert_eq!(backend.name(ObjectId(id)).unwrap(), id.to_string());
+    }
+    assert!(matches!(backend.name(ObjectId(4)), Err(NorError::NotFound)));
+}
+
+#[test]
+fn a_name_longer_than_a_page() {
+    let mut backend = mount(SmallFlash::new(4));
+    let name = "n".repeat(300);
+    backend.write(ObjectId(1), &name, &5u32).unwrap();
+    let mut backend = reboot(backend);
+    assert_eq!(backend.name(ObjectId(1)).unwrap(), name);
+    assert_eq!(backend.read::<u32>(ObjectId(1)).unwrap(), 5);
 }
 
 #[test]
@@ -100,6 +117,8 @@ fn garbage_collection_reuses_space() {
     for id in 0..3 {
         let last = 297 + id;
         assert_eq!(read(&mut backend, id), Some(bytes(last as u8, 100)));
+        // Relocated with the pages.
+        assert_eq!(backend.name(ObjectId(id)).unwrap(), id.to_string());
     }
     // Wear is spread over every sector.
     let counts: Vec<u32> = backend.erase_counts().collect();
@@ -160,13 +179,13 @@ fn usage_adds_up_while_collecting() {
 fn full_then_space_again() {
     let mut backend = mount(SmallFlash::new(3));
     let mut stored = 0;
-    while backend.write(ObjectId(stored), &bytes(0, 50)).is_ok() {
+    while backend.write(ObjectId(stored), "", &bytes(0, 50)).is_ok() {
         stored += 1;
     }
     // 3 sectors of 3 data pages, one sector kept for garbage collection.
     assert_eq!(stored, 6);
     assert!(matches!(
-        backend.write(ObjectId(99), &0u8),
+        backend.write(ObjectId(99), "", &0u8),
         Err(NorError::NoSpace)
     ));
 
@@ -192,11 +211,12 @@ fn another_format_version_fails_the_mount() {
     let mut backend = mount(SmallFlash::new(4));
     write(&mut backend, 1, &bytes(1, 300));
     let mut data = backend.flash.data;
-    // Firmware with format version 2 rewrote the sector headers, keeping them valid.
+    // Firmware with the next format version rewrote the sector headers, keeping them valid.
+    let next = FORMAT_VERSION + 1;
     let mut headers = 0;
     for header in data.chunks_mut(1024) {
         if header[..2] == 0x5453u16.to_le_bytes() {
-            header[2..4].copy_from_slice(&2u16.to_le_bytes());
+            header[2..4].copy_from_slice(&next.to_le_bytes());
             let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&header[..8]);
             header[8..12].copy_from_slice(&crc.to_le_bytes());
             headers += 1;
@@ -208,7 +228,7 @@ fn another_format_version_fails_the_mount() {
     let flash = SmallFlash::with_data(data).cut_at(0, Cut::FirstHalf);
     let range = 0..flash.data.len() as u32;
     let mounted = NorBackend::mount(NorConfig { flash, range });
-    assert!(matches!(mounted, Err(NorError::UnsupportedFormat(2))));
+    assert!(matches!(mounted, Err(NorError::UnsupportedFormat(v)) if v == next));
 }
 
 enum Op {
@@ -245,7 +265,7 @@ fn run(flash: SmallFlash, ops: &[Op]) -> (SmallFlash, Option<usize>) {
     let mut backend = mount(flash);
     for (index, op) in ops.iter().enumerate() {
         let result = match op {
-            Op::Write(id, value) => backend.write(ObjectId(*id), value),
+            Op::Write(id, value) => backend.write(ObjectId(*id), "", value),
             Op::Remove(id) => backend.remove(ObjectId(*id)),
         };
         if let Err(error) = result {

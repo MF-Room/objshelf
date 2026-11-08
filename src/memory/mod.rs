@@ -6,7 +6,7 @@
 //! - `cache`: cached objects, their use by `with` and `with_mut`, and their reads.
 //! - `names`: the names, `insert` and `remove`.
 //! - `write`: `flush` and `flush_object`, the only code that writes to the backend.
-//! - `lifecycle`: mount, with the name directory (object 0), and unmount.
+//! - `lifecycle`: mount, which reads the names stored with the objects, and unmount.
 //!
 //! The lock is the one of the RTIC resource: it blocks the tasks that share the `TierMem`, and
 //! only them. The work falls in three kinds:
@@ -45,12 +45,10 @@ pub(crate) struct Core<B: Backend> {
     /// How the backend's space is used, as of the last storage operation.
     usage: Usage,
 
-    // Names (`names.rs`).
+    // Names (`names.rs`). The backend stores each one with its object.
     directory: BTreeMap<String, ObjectId>,
-    /// The directory differs from the one stored as object 0 (`lifecycle.rs`).
-    directory_modified: bool,
-    /// Removed objects that the backend may still hold.
-    removed: Vec<ObjectId>,
+    /// Removed objects, with their names, that the backend may still hold.
+    removed: Vec<(ObjectId, String)>,
     next_id: u32,
 
     // Cached objects (`cache.rs`).
