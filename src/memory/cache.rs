@@ -68,7 +68,7 @@ impl<B: Backend> Core<B> {
         let value = value.downcast_mut::<T>().expect("checked above");
         let result = f(value);
         if modify {
-            let size = object::size(value);
+            let size = object::size::<B, _>(value);
             self.used = self.used - entry.size + size;
             if entry.modified {
                 self.modified_bytes -= entry.size;
@@ -100,7 +100,7 @@ impl<B: Backend> Core<B> {
 
     /// Caches `value` as the object `id`: `modified` if the backend does not hold it.
     pub(super) fn cache<T: Storable>(&mut self, id: ObjectId, value: T, modified: bool) {
-        let size = object::size(&value);
+        let size = object::size::<B, _>(&value);
         let last_use = self.next_tick();
         let entry = Entry {
             value: Box::new(value),

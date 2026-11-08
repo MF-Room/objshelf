@@ -77,7 +77,9 @@ use crate::{Error, Handle, Storable};
 /// # RAM budget
 ///
 /// Objects in RAM take about the `cache_bytes` given to [`mount`](Self::mount). Each one counts
-/// its size plus its serialized size, an estimate of what it owns on the heap.
+/// its size, what it owns on the heap (measured with [`GetSize`](get_size2::GetSize), spare
+/// capacity included), and its entry in the cache. Only the allocator's own overhead is not
+/// counted.
 ///
 /// - Over budget, the least recently used unmodified objects are dropped, with no I/O: they are
 ///   read again when needed. The object just used stays, even alone over budget.

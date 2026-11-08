@@ -6,14 +6,16 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 
+use get_size2::GetSize;
 use serde::{Deserialize, Serialize};
 
+use super::object;
 use crate::backend::Backend;
 use crate::backend::nor::mock::{Cut, MockFlash};
 use crate::backend::nor::{NorBackend, NorConfig, NorError};
 use crate::{
-    Error, Handle, Mutex, TierMem, flush, flush_object, get, get_or_insert_with, insert, list,
-    remove, usage, with, with_mut,
+    Error, Handle, Mutex, Storable, TierMem, flush, flush_object, get, get_or_insert_with, insert,
+    list, remove, usage, with, with_mut,
 };
 
 type Flash = MockFlash<1024>;
@@ -67,16 +69,27 @@ fn is_cached<T>(mem: &Mem, handle: &Handle<T>) -> bool {
     mem.core.cache.contains_key(&handle.id)
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, GetSize)]
 struct Settings {
     brightness: u8,
     name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, GetSize)]
 struct Blob(Vec<u8>);
 
-/// Inserts four flushed 100-byte blobs, which count 125 bytes each: two fit in 300 bytes.
+/// RAM counted for `value` in the cache.
+fn ram<T: Storable>(value: &T) -> usize {
+    object::size::<NorBackend<Flash>, T>(value)
+}
+
+/// A budget that two of the blobs of `blobs` fit in, but not three.
+fn two_blobs() -> usize {
+    let blob = ram(&Blob(vec![0; 100]));
+    2 * blob + blob / 2
+}
+
+/// Inserts four flushed 100-byte blobs.
 fn blobs(mem: &mut Mem) -> Vec<Handle<Blob>> {
     let add = |i: u8| {
         let blob = insert(mem, &i.to_string(), Blob(vec![i; 100]))
@@ -266,8 +279,24 @@ fn a_new_object_flushed_alone_survives_a_power_cut() {
 }
 
 #[test]
+fn ram_counts_spare_capacity() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    let notes = insert(&mut mem, "notes", Vec::<u32>::new())
+        .unwrap()
+        .unwrap();
+    let before = mem.core.used;
+    let capacity = with_mut(&mut mem, &notes, |n| {
+        n.reserve_exact(100);
+        n.capacity()
+    });
+    let capacity = capacity.unwrap().unwrap();
+    // Empty, but 4 bytes per element of capacity: a serialized estimate would count 0.
+    assert_eq!(mem.core.used, before + capacity * 4);
+}
+
+#[test]
 fn unmodified_objects_leave_ram_over_budget() {
-    let budget = 300;
+    let budget = two_blobs();
     let mut mem = mount(Flash::new(16), budget);
     let blobs = blobs(&mut mem);
     let stored = |mem: &Mem| mem.core.backend.as_ref().unwrap().usage();
@@ -285,7 +314,7 @@ fn full_until_flush() {
     let on_full = || {
         FULL.fetch_add(1, Ordering::Relaxed);
     };
-    let mut mem = Mem::mount(config(Flash::new(16)), 300, on_full).unwrap();
+    let mut mem = Mem::mount(config(Flash::new(16)), two_blobs(), on_full).unwrap();
     let blobs = blobs(&mut mem);
     with_mut(&mut mem, &blobs[0], |b| b.0[0] = 10)
         .unwrap()
@@ -318,7 +347,7 @@ fn full_until_flush() {
     with_mut(&mut mem, &blobs[2], |b| b.0[0] = 12)
         .unwrap()
         .unwrap();
-    let mut mem = mount(power_cut(mem), 300);
+    let mut mem = mount(power_cut(mem), two_blobs());
     let firsts: Vec<u8> = blobs
         .iter()
         .map(|blob| with(&mut mem, blob, |b| b.0[0]).unwrap().unwrap())
@@ -333,7 +362,8 @@ fn an_object_over_the_budget_stays_readable() {
         .unwrap()
         .unwrap();
     flush(&mut mem).unwrap().unwrap();
-    let mut mem = mount(power_cut(mem), 50);
+    // `big` alone is over this budget, an empty blob is not.
+    let mut mem = mount(power_cut(mem), ram(&Blob(vec![0; 50])));
     for _ in 0..3 {
         assert_eq!(with(&mut mem, &big, |b| b.0.len()).unwrap().unwrap(), 200);
         assert!(is_cached(&mem, &big));

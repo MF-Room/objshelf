@@ -32,7 +32,7 @@ impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
             if core.directory.contains_key(name) {
                 return Err(Error::AlreadyExists);
             }
-            let size = object::size(&value);
+            let size = object::size::<B, _>(&value);
             if size > core.cache_bytes {
                 return Err(Error::TooBig);
             }

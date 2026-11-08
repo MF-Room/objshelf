@@ -20,21 +20,28 @@ You need:
 [dependencies]
 tiermem = { git = "https://github.com/MF-Room/tiermem" }
 serde = { version = "1", default-features = false, features = ["derive"] }
+get-size2 = { version = "0.11", default-features = false, features = ["alloc", "derive"] }
 ```
+
+`get-size2` measures the RAM an object takes, its heap included, for the RAM budget. Its derive refers to
+it by name, so it must be a direct dependency, with the same version as tiermem's (`0.11`).
 
 The memory is an RTIC `#[shared]` resource. Every function takes it as its first argument, and takes the
 lock itself, for short steps only:
 
 ```rust
 // Inside your `#[rtic::app]` module. `Flash` is your blocking `NorFlash` driver.
+use get_size2::GetSize;
 use serde::{Deserialize, Serialize};
 use tiermem::backend::nor::{NorBackend, NorConfig};
 use tiermem::{Handle, TierMem};
 
 type Mem = TierMem<NorBackend<Flash>>;
 
-// Any `Serialize + Deserialize` type can be stored.
-#[derive(Default, Serialize, Deserialize)]
+// Any `Serialize + Deserialize + GetSize` type can be stored. For a field of a type without `GetSize`,
+// use `#[get_size(ignore)]` if it owns no heap (a `heapless` collection, for example), or
+// `#[get_size(size_fn = f)]`.
+#[derive(Default, Serialize, Deserialize, GetSize)]
 struct Settings {
     brightness: u8,
     name: String,
@@ -161,8 +168,9 @@ returns the first error: the object stays in RAM for the next flush.
 * **Busy flash.** While a flush has the flash, objects in RAM keep working; `with` and `with_mut` return
   `None` for the others. A task at the flush's priority or below never sees it: it can't run during the
   flush.
-* **RAM budget.** Each object in RAM counts its size plus its serialized size, an estimate of what it owns
-  on the heap. Over budget, the least recently used unchanged objects are dropped: they are read again
+* **RAM budget.** Each object in RAM counts its size, what it owns on the heap (measured with `GetSize`,
+  spare `Vec` capacity included) and its entry in the cache; only the allocator's own overhead is left
+  out. Over budget, the least recently used unchanged objects are dropped: they are read again
   when needed. Changed objects stay until a flush; when one more would not fit, the call calls `on_full`
   and returns `None`. An object bigger than the whole budget gets `TooBig` instead: no flush can make
   room for it.
@@ -221,8 +229,8 @@ Requirements, guarantees, time and space complexity: module documentation in
   - power cut during mount, which can write (stale pages marked obsolete): not tested yet
 - [x] Implement `TierMem` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, directory
   object (id 0), LRU read cache with a RAM budget, changes kept in RAM until a flush
-- [ ] RAM accounting: the size of an object in RAM is estimated from its serialized size (spare `Vec`
-  capacity is not counted)
+- [x] RAM accounting: an object counts its heap with `get-size2`, spare capacity included, instead of a
+  serialized-size estimate
 - [x] `Error::TooBig` from `with_mut` and `insert` for an object bigger than the whole RAM budget, instead
   of `None` forever
 - [x] A flush writes the other objects and the names when one object fails to write (for example with

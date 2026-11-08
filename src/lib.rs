@@ -8,6 +8,7 @@ mod memory;
 
 use core::marker::PhantomData;
 
+use get_size2::GetSize;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub use api::{
@@ -22,11 +23,12 @@ pub use rtic_core::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjectId(u32);
 
-/// Types that can be kept in a [`TierMem`]: serialized when they go to the backend. `Send`, as
-/// RTIC shares resources between tasks of different priorities.
-pub trait Storable: Serialize + DeserializeOwned + Send + 'static {}
+/// Types that can be kept in a [`TierMem`]: serialized when they go to the backend, and measured
+/// in RAM with [`GetSize`] from the `get-size2` crate (`#[derive(GetSize)]`). `Send`, as RTIC
+/// shares resources between tasks of different priorities.
+pub trait Storable: Serialize + DeserializeOwned + GetSize + Send + 'static {}
 
-impl<T: Serialize + DeserializeOwned + Send + 'static> Storable for T {}
+impl<T: Serialize + DeserializeOwned + GetSize + Send + 'static> Storable for T {}
 
 /// Typed handle to an object of type `T`, obtained from [`get`] or [`insert`].
 ///
