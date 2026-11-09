@@ -191,7 +191,10 @@ stays in RAM for the next flush.
   fails its flush with `NoSpace`, and the flush goes on with the others. A read or write also holds the
   whole serialized object on the heap while it runs. The NOR region is aligned to the erase size, has at
   least 2 sectors (one stays free for garbage collection) and at most 16 MiB, and is used by nothing
-  else.
+  else. Each write of an object gets the next number of a `u32` counter, and mount keeps the copy with
+  the highest one. The flash wears out before that counter can wrap: each write programs at least one
+  page, and a W25Q16JV takes about 768 million page writes in its life (512 sectors × 15 data pages ×
+  100 000 erases), against 4.3 billion numbers. Only a region of about 11 MiB or more could get there.
 
 Details: the `TierMem` documentation in [`src/api.rs`](src/api.rs), the public API. The engine behind it is
 in [`src/memory`](src/memory/mod.rs).
@@ -235,8 +238,6 @@ Requirements, guarantees, time and space complexity: module documentation in
   - a corrupted sector header makes mount ignore the whole sector and its objects
   - skipped dirty pages can eat into the GC reserve; GC refuses a victim whose live pages don't fit
   - peak RAM: `write` and `read` hold the whole serialized object, plus the page list
-  - limits: at most 65536 pages in the region (16 MiB with 256-byte pages), `u16` pages per object,
-    `u32` version counter (wraps after 4 billion writes)
 - [x] Implement `TierMem` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names
   stored with the objects, LRU read cache with a RAM budget, changes kept in RAM until a flush
 - [x] RAM accounting: an object counts its heap with `get-size2`, spare capacity included, instead of a
