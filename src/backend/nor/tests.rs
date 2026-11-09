@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crc::{CRC_32_ISO_HDLC, Crc};
 use serde::{Deserialize, Serialize};
 
-use super::layout::FORMAT_VERSION;
+use super::layout::{FORMAT_VERSION, PAGE_SIZE, PageHeader};
 use super::mock::{Cut, MockError, MockFlash};
 use super::{NorBackend, NorConfig, NorError};
 use crate::ObjectId;
@@ -322,4 +322,60 @@ fn power_cut_at_every_operation() {
             assert_eq!(read(&mut backend, 3), Some(bytes(9, 50)));
         }
     }
+}
+
+/// Three objects, then only updates of two of them: every later write has an old version to
+/// replace, and garbage collection moves the pages of object 3.
+fn updates() -> Vec<Op> {
+    let round = |round| {
+        [
+            Op::Write(1, bytes(round, 20)),
+            Op::Write(2, bytes(round, 300)),
+        ]
+    };
+    let mut ops = vec![Op::Write(3, bytes(0, 20))];
+    ops.extend((0..12).flat_map(round));
+    ops
+}
+
+#[test]
+fn a_page_cut_in_an_update_or_a_relocation_is_written_again() {
+    let ops = updates();
+    let first_update = run(SmallFlash::new(3), &ops[..3]).0.ops;
+    let total = run(SmallFlash::new(3), &ops).0.ops;
+    let mut weak = 0;
+    for at in first_update..total {
+        // Only the first half of the cut write is done. When that holds the header and payload,
+        // the page reads whole, as a page whose write the cut left with weak bits.
+        let (flash, _) = run(SmallFlash::new(3).cut_at(at, Cut::FirstHalf), &ops);
+        let Some(offset) = flash.cut_write else {
+            // An erase.
+            continue;
+        };
+        let cut = offset as usize / PAGE_SIZE;
+        let left: [u8; PAGE_SIZE] = flash.data[cut * PAGE_SIZE..][..PAGE_SIZE]
+            .try_into()
+            .unwrap();
+        // A whole page, not a marker.
+        if (offset as usize).is_multiple_of(PAGE_SIZE) && PageHeader::decode(&left).is_some() {
+            weak += 1;
+        }
+
+        // The page can be erased and written again by the mount, as with any other page.
+        let backend = mount(SmallFlash::with_data(flash.data));
+        let mut live = backend.objects.values().flat_map(|object| &object.pages);
+        let left_live = live.any(|&page| usize::from(page) == cut)
+            && backend.flash.data[cut * PAGE_SIZE..][..PAGE_SIZE] == left;
+        assert!(
+            !left_live,
+            "cut at operation {at}: page {cut} is live as the cut left it"
+        );
+    }
+    assert!(weak > 0);
+}
+
+#[test]
+fn a_clean_mount_writes_nothing() {
+    let (flash, _) = run(SmallFlash::new(3), &updates());
+    assert_eq!(mount(SmallFlash::with_data(flash.data)).flash.ops, 0);
 }

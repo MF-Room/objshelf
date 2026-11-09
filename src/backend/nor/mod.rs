@@ -25,6 +25,9 @@
 //! - A `write` or `remove` is on flash when it returns: nothing is buffered.
 //! - Each object is updated atomically. There are no transactions over several objects.
 //! - After a power cut at any point, mount restores a consistent state.
+//! - A page write cut by a power loss can leave weak bits: the page reads right, then turns
+//!   `Corrupt` later. When the cut hit an update or a garbage collection, mount sees it and writes
+//!   the object again. When it hit the very end of an object's first write, nothing tells.
 //! - Each sector header holds the version of the on-flash format: mount fails with
 //!   [`NorError::UnsupportedFormat`] on a sector of another version, instead of erasing it as
 //!   unformatted.
@@ -36,7 +39,7 @@
 //!
 //! | Operation | Flash | CPU |
 //! |---|---|---|
-//! | `mount` | reads all `N` pages; after a crash, one 1-byte write per stale page | `O(N + S)` |
+//! | `mount` | reads all `N` pages; after a crash, one 1-byte write per stale page and a `write` of each object that had some | `O(N + S)` |
 //! | `read` | `k` page reads | `O(len)` |
 //! | `write`, no GC | `k` blank-check reads, `k` page writes, `k'` 1-byte writes | `O(len + S)` |
 //! | `remove` | `k'` 1-byte writes | `O(k')` |
@@ -74,6 +77,7 @@ pub(crate) mod mock;
 #[cfg(test)]
 mod tests;
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -254,6 +258,68 @@ impl<F: NorFlash> NorBackend<F> {
         Ok(())
     }
 
+    /// The object `id` as stored: serialized with its name.
+    fn read_data(&mut self, id: ObjectId) -> Result<Vec<u8>, NorError<F::Error>> {
+        let count = self.objects.get(&id).ok_or(NorError::NotFound)?.pages.len();
+        let mut data = Vec::with_capacity(count * PAYLOAD_SIZE);
+        for index in 0..count {
+            self.read_payload(id, index, &mut data)?;
+        }
+        Ok(data)
+    }
+
+    /// Writes `data`, the object `id` serialized with its name, as its new version, then releases
+    /// the old one.
+    fn write_data(&mut self, id: ObjectId, data: &[u8]) -> Result<(), NorError<F::Error>> {
+        let count = data.len().div_ceil(PAYLOAD_SIZE).max(1);
+        let header_count = u16::try_from(count).map_err(|_| NorError::NoSpace)?;
+        self.ensure_space(count)?;
+
+        let version = self.next_version;
+        self.next_version += 1;
+        let mut pages = Vec::with_capacity(count);
+        for index in 0..count {
+            let chunk = &data[(index * PAYLOAD_SIZE).min(data.len())
+                ..((index + 1) * PAYLOAD_SIZE).min(data.len())];
+            let header = PageHeader {
+                index: index as u16,
+                object_id: id.0,
+                version,
+                count: header_count,
+                len: chunk.len() as u16,
+            };
+            let page = self.alloc_page()?;
+            let addr = self.page_addr(page);
+            self.program(addr, &header.encode(chunk))?;
+            pages.push(page as u16);
+        }
+
+        // Every page is on flash: the new version is complete, the old one can go.
+        for &page in &pages {
+            self.sectors[Self::sector_of(usize::from(page))].live += 1;
+        }
+        if let Some(old) = self.objects.insert(id, Object { version, pages }) {
+            self.release(&old.pages)?;
+        }
+        Ok(())
+    }
+
+    /// Writes the object `id` again, to new pages, as the power was cut while one of its pages
+    /// may have been written: the page can read right, with weak bits that flip later (see
+    /// `scan`). Does nothing if the object is gone, does not fit (`NoSpace`) or reads `Corrupt`.
+    fn rewrite(&mut self, id: ObjectId) -> Result<(), NorError<F::Error>> {
+        if !self.objects.contains_key(&id) {
+            return Ok(());
+        }
+        let result = self
+            .read_data(id)
+            .and_then(|data| self.write_data(id, &data));
+        match result {
+            Err(NorError::NoSpace | NorError::Corrupt) => Ok(()),
+            result => result,
+        }
+    }
+
     /// Marks the pages of a replaced or removed version obsolete.
     fn release(&mut self, pages: &[u16]) -> Result<(), NorError<F::Error>> {
         for &page in pages {
@@ -377,10 +443,17 @@ impl<F: NorFlash> NorBackend<F> {
     }
 
     /// Rebuilds the RAM state from flash and marks every stale page obsolete, so that each
-    /// object has a single version left on flash.
-    fn scan(&mut self) -> Result<(), NorError<F::Error>> {
+    /// object has a single version left on flash. Returns the objects that had stale pages.
+    ///
+    /// Stale pages are what a power cut leaves behind, next to the last page it hit, which can be
+    /// weak. In an update, the old version is not obsolete yet; in a relocation, the moved page
+    /// still has its first copy. Neither tells a weak page from a sound one, so the objects
+    /// returned are written again. The first write of an object leaves no stale page: cut at its
+    /// very end, its last page can be weak and is not caught.
+    fn scan(&mut self) -> Result<BTreeSet<ObjectId>, NorError<F::Error>> {
         let mut found: HashMap<ObjectId, Vec<Candidate>> = HashMap::new();
         let mut stale = Vec::new();
+        let mut suspects = BTreeSet::new();
         let mut max_version = None;
         // Newest version seen in each sector, to find the sector written last.
         let mut newest = vec![None; self.sectors.len()];
@@ -433,6 +506,7 @@ impl<F: NorFlash> NorBackend<F> {
                     || candidate.pages[slot].is_some()
                 {
                     stale.push(page);
+                    suspects.insert(ObjectId(header.object_id));
                 } else {
                     candidate.pages[slot] = Some(page as u16);
                 }
@@ -455,6 +529,7 @@ impl<F: NorFlash> NorBackend<F> {
                     self.objects.insert(id, Object { version, pages });
                 } else {
                     stale.extend(pages.into_iter().map(usize::from));
+                    suspects.insert(id);
                 }
             }
         }
@@ -475,7 +550,7 @@ impl<F: NorFlash> NorBackend<F> {
             }
         }
         self.next_version = max_version.map_or(0, |v| v + 1);
-        Ok(())
+        Ok(suspects)
     }
 }
 
@@ -517,7 +592,9 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
             active: None,
             next_version: 0,
         };
-        backend.scan()?;
+        for id in backend.scan()? {
+            backend.rewrite(id)?;
+        }
         Ok(backend)
     }
 
@@ -528,45 +605,11 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
         value: &T,
     ) -> Result<(), Self::Error> {
         let data = postcard::to_allocvec(&(name, value)).map_err(NorError::Serialization)?;
-        let count = data.len().div_ceil(PAYLOAD_SIZE).max(1);
-        let header_count = u16::try_from(count).map_err(|_| NorError::NoSpace)?;
-        self.ensure_space(count)?;
-
-        let version = self.next_version;
-        self.next_version += 1;
-        let mut pages = Vec::with_capacity(count);
-        for index in 0..count {
-            let chunk = &data[(index * PAYLOAD_SIZE).min(data.len())
-                ..((index + 1) * PAYLOAD_SIZE).min(data.len())];
-            let header = PageHeader {
-                index: index as u16,
-                object_id: id.0,
-                version,
-                count: header_count,
-                len: chunk.len() as u16,
-            };
-            let page = self.alloc_page()?;
-            let addr = self.page_addr(page);
-            self.program(addr, &header.encode(chunk))?;
-            pages.push(page as u16);
-        }
-
-        // Every page is on flash: the new version is complete, the old one can go.
-        for &page in &pages {
-            self.sectors[Self::sector_of(usize::from(page))].live += 1;
-        }
-        if let Some(old) = self.objects.insert(id, Object { version, pages }) {
-            self.release(&old.pages)?;
-        }
-        Ok(())
+        self.write_data(id, &data)
     }
 
     fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, Self::Error> {
-        let count = self.objects.get(&id).ok_or(NorError::NotFound)?.pages.len();
-        let mut data = Vec::with_capacity(count * PAYLOAD_SIZE);
-        for index in 0..count {
-            self.read_payload(id, index, &mut data)?;
-        }
+        let data = self.read_data(id)?;
         let (_name, value): (&str, T) =
             postcard::from_bytes(&data).map_err(NorError::Serialization)?;
         Ok(value)

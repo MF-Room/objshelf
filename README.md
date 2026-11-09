@@ -211,6 +211,8 @@ in [`src/memory`](src/memory/mod.rs).
 * RAM index: `ObjectId` → current version and page list (`hashbrown::HashMap`, needs a heap).
 * Each write gets a new global version. A version counts only once all its pages are on flash, so a power
   cut leaves either the old or the new value. Replaced and removed pages are then marked obsolete.
+* A page whose write was cut can read right and lose weak bits later. When the cut hit an update or a
+  garbage collection, the old copy is still there at mount, which then writes the object again.
 * Every byte is programmed once between erases, and only from `0xFF`.
 * Garbage collection relocates the live pages of the sector with the most garbage and erases it; one free
   sector is kept for it. Ties go to the least worn sector.
@@ -232,9 +234,9 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [x] Format version in the sector header: mount fails on another version instead of erasing it
 - [ ] Edge cases:
   - after a flash error, the RAM state may not match the flash: define the rule (remount?)
-  - a page that decays after its write (weak bits after a cut, bit rot) only shows up as `Corrupt` on
-    read: the previous version is already marked obsolete, so there is no fallback; optional read-back
-    verify after writing
+  - a page that decays after its write only shows up as `Corrupt` on read, with no fallback: bit rot,
+    or weak bits after a cut at the very end of an object's first write (an update or a garbage
+    collection cut that way is written again at mount)
   - a corrupted sector header makes mount ignore the whole sector and its objects
   - skipped dirty pages can eat into the GC reserve; GC refuses a victim whose live pages don't fit
   - peak RAM: `write` and `read` hold the whole serialized object, plus the page list

@@ -44,6 +44,8 @@ pub(crate) struct MockFlash<const ERASE_SIZE: usize> {
     pub(crate) data: Vec<u8>,
     /// Program and erase operations done so far.
     pub(super) ops: usize,
+    /// Offset of the write the power was cut in, if a write was cut.
+    pub(super) cut_write: Option<u32>,
     cut: Option<(usize, Cut)>,
     dead: bool,
     /// Runs at the start of each program operation, as an interrupt during a write.
@@ -62,6 +64,7 @@ impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
         Self {
             data,
             ops: 0,
+            cut_write: None,
             cut: None,
             dead: false,
             on_write: None,
@@ -187,6 +190,9 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
             panic!("programming a byte that is not erased at {at:#x}");
         }
         let cut = self.next_op()?;
+        if cut.is_some() {
+            self.cut_write = Some(offset);
+        }
         for at in part(range.clone(), cut) {
             self.data[at] &= bytes[at - range.start];
         }
