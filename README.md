@@ -253,5 +253,4 @@ Requirements, guarantees, time and space complexity: module documentation in
   or a wrong decode
 - [x] Max name length: `MAX_NAME_LEN`, 64 bytes, `NameTooLong` from `insert`
 - [x] Max object size and flash region used by tiermem: documented (Limits)
-- [ ] Schema versioning and migration of stored types
 - [x] Host tests with a simulated `NorFlash` (power cuts, two geometries), `cargo test` in CI
