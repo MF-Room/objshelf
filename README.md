@@ -1,4 +1,4 @@
-# tiermem
+# objshelf
 
 Software-managed object memory for embedded Rust, with typed access, transparent residency, and pluggable
 storage backends.
@@ -11,20 +11,20 @@ Changes stay in RAM until you flush them, so the slow flash writes only happen w
 You need:
 
 * a heap (`alloc`): a global allocator, for example [`embedded-alloc`](https://crates.io/crates/embedded-alloc);
-* [RTIC 2](https://rtic.rs), or any lock that implements its `Mutex` trait (re-exported as `tiermem::Mutex`);
+* [RTIC 2](https://rtic.rs), or any lock that implements its `Mutex` trait (re-exported as `objshelf::Mutex`);
 * a backend. The NOR backend runs on any blocking `embedded_storage::nor_flash::NorFlash` driver with
   `READ_SIZE` and `WRITE_SIZE` of 1 and an `ERASE_SIZE` that is a multiple of 256: an SPI NOR driver,
   internal MCU flash, or a RAM simulation for tests.
 
 ```toml
 [dependencies]
-tiermem = { git = "https://github.com/MF-Room/tiermem" }
+objshelf = { git = "https://github.com/MF-Room/objshelf" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 get-size2 = { version = "0.11", default-features = false, features = ["alloc", "derive"] }
 ```
 
 `get-size2` measures the RAM an object takes, its heap included, for the RAM budget. Its derive refers to
-it by name, so it must be a direct dependency, with the same version as tiermem's (`0.11`).
+it by name, so it must be a direct dependency, with the same version as objshelf's (`0.11`).
 
 The memory is an RTIC `#[shared]` resource. Every function takes it as its first argument, and takes the
 lock itself, for short steps only:
@@ -33,10 +33,10 @@ lock itself, for short steps only:
 // Inside your `#[rtic::app]` module. `Flash` is your blocking `NorFlash` driver.
 use get_size2::GetSize;
 use serde::{Deserialize, Serialize};
-use tiermem::backend::nor::{NorBackend, NorConfig};
-use tiermem::{Handle, TierMem};
+use objshelf::backend::nor::{NorBackend, NorConfig};
+use objshelf::{Handle, ObjShelf};
 
-type Mem = TierMem<NorBackend<Flash>>;
+type Mem = ObjShelf<NorBackend<Flash>>;
 
 // Any `Serialize + Deserialize + GetSize` type can be stored. For a field of a type without `GetSize`,
 // use `#[get_size(ignore)]` if it owns no heap (a `heapless` collection, for example), or
@@ -61,7 +61,7 @@ struct Local {
 #[init]
 fn init(cx: init::Context) -> (Shared, Local) {
     let flash = Flash::new(/* SPI bus, chip select, ... */);
-    // Region of the flash used by tiermem: aligned to the erase size, at least 2 sectors.
+    // Region of the flash used by objshelf: aligned to the erase size, at least 2 sectors.
     let config = NorConfig { flash, range: 0..64 * 4096 };
     // Blocks while the flash is mounted. Objects in RAM take about 16 KiB. The closure runs when
     // unflushed changes fill that budget: here it starts the `save` task.
@@ -71,7 +71,7 @@ fn init(cx: init::Context) -> (Shared, Local) {
     .unwrap();
     // Finds the object after a reboot, or creates it on the first boot. Before `mem` is shared,
     // the functions take it directly.
-    let settings = tiermem::get_or_insert_with(&mut mem, "settings", Settings::default)
+    let settings = objshelf::get_or_insert_with(&mut mem, "settings", Settings::default)
         .unwrap()
         .expect("fits in the RAM budget");
     app::spawn().unwrap();
@@ -84,12 +84,12 @@ async fn app(mut cx: app::Context) {
     let settings = cx.local.settings;
     let mem = &mut cx.shared.mem;
     // Reads the object from flash if it is not in RAM.
-    let Some(brightness) = tiermem::with(mem, settings, |s| s.brightness).unwrap() else {
+    let Some(brightness) = objshelf::with(mem, settings, |s| s.brightness).unwrap() else {
         // Not in RAM, and a flush has the flash: try again later.
         return;
     };
     // Changes RAM only, until the next flush.
-    match tiermem::with_mut(mem, settings, |s| s.brightness = brightness + 1).unwrap() {
+    match objshelf::with_mut(mem, settings, |s| s.brightness = brightness + 1).unwrap() {
         // Writes the settings soon, and only them.
         Some(()) => {
             save_settings::spawn(*settings).ok();
@@ -106,30 +106,30 @@ async fn app(mut cx: app::Context) {
 // Writes all the changes. Spawned by `on_full`: only a full flush frees the whole budget.
 #[task(priority = 1, shared = [mem])]
 async fn save(mut cx: save::Context) {
-    tiermem::flush(&mut cx.shared.mem).unwrap();
+    objshelf::flush(&mut cx.shared.mem).unwrap();
 }
 
 // Writes only the settings: the other changes stay in RAM until `save` runs. A handle is `Copy`, so
 // it can be a spawn argument.
 #[task(priority = 1, shared = [mem])]
 async fn save_settings(mut cx: save_settings::Context, settings: Handle<Settings>) {
-    tiermem::flush_object(&mut cx.shared.mem, &settings).unwrap();
+    objshelf::flush_object(&mut cx.shared.mem, &settings).unwrap();
 }
 ```
 
 No function waits, so any task can call any of them. When a call can't be done now, it returns `Ok(None)`
-and does nothing: try again later. Tasks that don't share `mem` are never blocked by tiermem, whatever their
+and does nothing: try again later. Tasks that don't share `mem` are never blocked by objshelf, whatever their
 priority.
 
 ## API
 
 In a task, `mem` is `&mut cx.shared.mem`. In `init`, before the memory is shared, it is `&mut mem` on the
-owned `TierMem`.
+owned `ObjShelf`.
 
 | Function | What it does |
 |---|---|
-| `TierMem::mount(config, cache_bytes, on_full)` | Mounts the backend and reads the names of the stored objects, blocking (for `init`). `cache_bytes` is the RAM budget, `on_full` is called when unflushed changes fill it. |
-| `TierMem::unmount(self)` | Flushes, then unmounts the backend. |
+| `ObjShelf::mount(config, cache_bytes, on_full)` | Mounts the backend and reads the names of the stored objects, blocking (for `init`). `cache_bytes` is the RAM budget, `on_full` is called when unflushed changes fill it. |
+| `ObjShelf::unmount(self)` | Flushes, then unmounts the backend. |
 | `list(mem)` | Names of all objects. |
 | `get::<T, _>(mem, name)` | Handle to the object `name`, of type `T`. `NotFound` if it doesn't exist. |
 | `insert(mem, name, value)` | Adds a new object and returns its handle. `AlreadyExists` if the name is taken, `NameTooLong` over 64 bytes (`MAX_NAME_LEN`). |
@@ -196,7 +196,7 @@ stays in RAM for the next flush.
   page, and a W25Q16JV takes about 768 million page writes in its life (512 sectors × 15 data pages ×
   100 000 erases), against 4.3 billion numbers. Only a region of about 11 MiB or more could get there.
 
-Details: the `TierMem` documentation in [`src/api.rs`](src/api.rs), the public API. The engine behind it is
+Details: the `ObjShelf` documentation in [`src/api.rs`](src/api.rs), the public API. The engine behind it is
 in [`src/memory`](src/memory/mod.rs).
 
 ## NOR flash backend
@@ -240,7 +240,7 @@ Requirements, guarantees, time and space complexity: module documentation in
   - a corrupted sector header makes mount ignore the whole sector and its objects
   - skipped dirty pages can eat into the GC reserve; GC refuses a victim whose live pages don't fit
   - peak RAM: `write` and `read` hold the whole serialized object, plus the page list
-- [x] Implement `TierMem` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names
+- [x] Implement `ObjShelf` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names
   stored with the objects, LRU read cache with a RAM budget, changes kept in RAM until a flush
 - [x] RAM accounting: an object counts its heap with `get-size2`, spare capacity included, instead of a
   serialized-size estimate
@@ -254,5 +254,5 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [ ] Type check on read: a stored type tag or schema hash in the backend, instead of a postcard error
   or a wrong decode
 - [x] Max name length: `MAX_NAME_LEN`, 64 bytes, `NameTooLong` from `insert`
-- [x] Max object size and flash region used by tiermem: documented (Limits)
+- [x] Max object size and flash region used by objshelf: documented (Limits)
 - [x] Host tests with a simulated `NorFlash` (power cuts, two geometries), `cargo test` in CI

@@ -10,9 +10,9 @@ use rtic_core::Mutex;
 use super::object;
 use super::{Core, Locked};
 use crate::backend::Backend;
-use crate::{Error, MAX_NAME_LEN, ObjectId, Storable, TierMem};
+use crate::{Error, MAX_NAME_LEN, ObjShelf, ObjectId, Storable};
 
-impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
+impl<B: Backend, M: Mutex<T = ObjShelf<B>>> Locked<'_, M> {
     pub(crate) fn list(&mut self) -> Vec<String> {
         self.lock(|core| core.directory.keys().cloned().collect())
     }

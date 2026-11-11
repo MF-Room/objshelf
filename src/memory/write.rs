@@ -11,12 +11,12 @@ use rtic_core::Mutex;
 
 use super::Locked;
 use crate::backend::Backend;
-use crate::{Error, ObjectId, TierMem};
+use crate::{Error, ObjShelf, ObjectId};
 
 /// Removed objects, with their names.
 type Removed = Vec<(ObjectId, String)>;
 
-impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
+impl<B: Backend, M: Mutex<T = ObjShelf<B>>> Locked<'_, M> {
     /// Writes the objects modified when this starts, each once, so an interrupt that keeps
     /// modifying objects cannot keep it going. Each object is written with its name, so a new one
     /// is stored with it at once. Then removes the removed objects.

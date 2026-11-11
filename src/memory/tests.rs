@@ -14,12 +14,12 @@ use crate::backend::Backend;
 use crate::backend::nor::mock::{Cut, MockError, MockFlash};
 use crate::backend::nor::{NorBackend, NorConfig, NorError};
 use crate::{
-    Error, Handle, MAX_NAME_LEN, Mutex, ObjectId, Storable, TierMem, flush, flush_object, get,
+    Error, Handle, MAX_NAME_LEN, Mutex, ObjShelf, ObjectId, Storable, flush, flush_object, get,
     get_or_insert_with, insert, list, remove, usage, with, with_mut,
 };
 
 type Flash = MockFlash<1024>;
-type Mem = TierMem<NorBackend<Flash>>;
+type Mem = ObjShelf<NorBackend<Flash>>;
 
 const CACHE: usize = 4096;
 

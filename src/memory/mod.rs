@@ -1,6 +1,6 @@
-//! The engine behind the public API of `api.rs`: the state of a `TierMem` (`Core`), and the code
+//! The engine behind the public API of `api.rs`: the state of an `ObjShelf` (`Core`), and the code
 //! that moves objects between RAM and the backend, reaching that state through the lock of the
-//! `TierMem` (`Locked`).
+//! `ObjShelf` (`Locked`).
 //!
 //! - `object`: cached objects with their type erased.
 //! - `cache`: cached objects, their use by `with` and `with_mut`, and their reads.
@@ -8,7 +8,7 @@
 //! - `write`: `flush` and `flush_object`, the only code that writes to the backend.
 //! - `lifecycle`: mount, which reads the names stored with the objects, and unmount.
 //!
-//! The lock is the one of the RTIC resource: it blocks the tasks that share the `TierMem`, and
+//! The lock is the one of the RTIC resource: it blocks the tasks that share the `ObjShelf`, and
 //! only them. The work falls in three kinds:
 //!
 //! - Changes (`with_mut`, `insert`, `remove`): in RAM only, inside the lock. They stay there
@@ -35,10 +35,10 @@ use hashbrown::HashMap;
 use rtic_core::Mutex;
 
 use crate::backend::{Backend, Usage};
-use crate::{ObjectId, TierMem};
+use crate::{ObjShelf, ObjectId};
 use cache::Entry;
 
-/// The state of a `TierMem`.
+/// The state of an `ObjShelf`.
 pub(crate) struct Core<B: Backend> {
     /// The backend, `None` while a write uses it: the storage is busy.
     backend: Option<B>,
@@ -65,10 +65,10 @@ pub(crate) struct Core<B: Backend> {
     tick: u64,
 }
 
-/// A `TierMem` reached through its lock `M`.
+/// An `ObjShelf` reached through its lock `M`.
 pub(crate) struct Locked<'a, M>(pub(crate) &'a mut M);
 
-impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
+impl<B: Backend, M: Mutex<T = ObjShelf<B>>> Locked<'_, M> {
     /// Runs `f` on the core, inside the lock.
     fn lock<R>(&mut self, f: impl FnOnce(&mut Core<B>) -> R) -> R {
         self.0.lock(|mem| f(&mut mem.core))

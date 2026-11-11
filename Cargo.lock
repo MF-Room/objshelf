@@ -144,6 +144,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "objshelf"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "embedded-storage",
+ "get-size2",
+ "hashbrown",
+ "postcard",
+ "rtic-core",
+ "serde",
+]
+
+[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -277,19 +290,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "tiermem"
-version = "0.1.0"
-dependencies = [
- "crc",
- "embedded-storage",
- "get-size2",
- "hashbrown",
- "postcard",
- "rtic-core",
- "serde",
 ]
 
 [[package]]

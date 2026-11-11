@@ -1,4 +1,4 @@
-//! Objects in RAM: `Locked::with`, behind `tiermem::with` and `tiermem::with_mut`, which reads an
+//! Objects in RAM: `Locked::with`, behind `objshelf::with` and `objshelf::with_mut`, which reads an
 //! object from the backend if it is not in RAM, and drops unmodified objects over the budget.
 //! Nothing here writes to the backend.
 
@@ -10,7 +10,7 @@ use rtic_core::Mutex;
 use super::object::{self, Cached};
 use super::{Core, Locked};
 use crate::backend::Backend;
-use crate::{Error, ObjectId, Storable, TierMem};
+use crate::{Error, ObjShelf, ObjectId, Storable};
 
 pub(super) struct Entry<B: Backend> {
     pub(super) value: Box<dyn Cached<B>>,
@@ -22,7 +22,7 @@ pub(super) struct Entry<B: Backend> {
     pub(super) last_use: u64,
 }
 
-impl<B: Backend, M: Mutex<T = TierMem<B>>> Locked<'_, M> {
+impl<B: Backend, M: Mutex<T = ObjShelf<B>>> Locked<'_, M> {
     /// Runs `f` on the object `id`. With `modify`, the object is then modified.
     pub(crate) fn with<T: Storable, R>(
         &mut self,

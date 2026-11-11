@@ -14,8 +14,8 @@
 //!   needed: every byte is programmed at most once between erases, and only from `0xFF`. Chips with
 //!   internal ECC (`WRITE_SIZE > 1`) are not supported.
 //! - **Region**: aligned to `ERASE_SIZE`, at least 2 sectors (one is kept free for garbage
-//!   collection), at most 65536 pages (16 MiB), used by nothing else: a sector without a
-//!   tiermem header is erased when it is needed.
+//!   collection), at most 65536 pages (16 MiB), used by nothing else: a sector without an
+//!   objshelf header is erased when it is needed.
 //! - **Blocking**: each flash operation runs to completion when the driver is called, and so does
 //!   each backend operation.
 //! - **Values**: `Serialize` / `DeserializeOwned` (postcard).

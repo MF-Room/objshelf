@@ -13,7 +13,7 @@ use crate::ObjectId;
 /// written with it, so the names are stored nowhere else.
 ///
 /// One operation runs at a time (`&mut self`), blocking until done.
-// `'static` because `TierMem` erases the types of the objects it caches, which names the backend.
+// `'static` because `ObjShelf` erases the types of the objects it caches, which names the backend.
 pub trait Backend: Sized + 'static {
     /// Errors of the backend and of its storage driver.
     type Error;

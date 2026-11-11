@@ -215,7 +215,7 @@ fn another_format_version_fails_the_mount() {
     let next = FORMAT_VERSION + 1;
     let mut headers = 0;
     for header in data.chunks_mut(1024) {
-        if header[..2] == 0x5453u16.to_le_bytes() {
+        if header[..2] == 0x4F53u16.to_le_bytes() {
             header[2..4].copy_from_slice(&next.to_le_bytes());
             let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&header[..8]);
             header[8..12].copy_from_slice(&crc.to_le_bytes());

@@ -23,10 +23,10 @@ const PAGE_HEADER_SIZE: usize = 20;
 /// Object bytes in one data page.
 pub(super) const PAYLOAD_SIZE: usize = MARKER_OFFSET - PAGE_HEADER_SIZE;
 
-// `0x54` is ASCII `T`, for tiermem, and `0x53` is `S`, for sector. Neither magic is all `0xFF`
+// `0x4F` is ASCII `O`, for objshelf, and `0x53` is `S`, for sector. Neither magic is all `0xFF`
 // (erased) or all `0x00`, and a CRC follows each of them.
-const PAGE_MAGIC: u16 = 0x5401;
-const SECTOR_MAGIC: u16 = 0x5453;
+const PAGE_MAGIC: u16 = 0x4F01;
+const SECTOR_MAGIC: u16 = 0x4F53;
 
 /// Version of the on-flash format, in each sector header. Mount fails on a sector of another
 /// version instead of erasing it as unformatted. 0 until the first release: change it when a

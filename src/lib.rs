@@ -12,11 +12,11 @@ use get_size2::GetSize;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub use api::{
-    TierMem, flush, flush_object, get, get_or_insert_with, insert, list, remove, usage, with,
+    ObjShelf, flush, flush_object, get, get_or_insert_with, insert, list, remove, usage, with,
     with_mut,
 };
 /// The lock trait of RTIC 2 (`rtic::Mutex`): the functions of this crate take anything that
-/// implements it. Implement it to share a `TierMem` without RTIC.
+/// implements it. Implement it to share an `ObjShelf` without RTIC.
 pub use rtic_core::Mutex;
 
 /// Longest name of an object, in bytes of UTF-8. A name is written again with each write of its
@@ -28,7 +28,7 @@ pub const MAX_NAME_LEN: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjectId(u32);
 
-/// Types that can be kept in a [`TierMem`]: serialized when they go to the backend, and measured
+/// Types that can be kept in an [`ObjShelf`]: serialized when they go to the backend, and measured
 /// in RAM with [`GetSize`] from the `get-size2` crate (`#[derive(GetSize)]`). `Send`, as RTIC
 /// shares resources between tasks of different priorities.
 pub trait Storable: Serialize + DeserializeOwned + GetSize + Send + 'static {}
@@ -62,7 +62,7 @@ impl<T> Clone for Handle<T> {
 
 impl<T> Copy for Handle<T> {}
 
-/// Errors of [`TierMem`], generic over the backend's error `E`.
+/// Errors of [`ObjShelf`], generic over the backend's error `E`.
 #[derive(Debug)]
 pub enum Error<E> {
     /// No object with this name, or the object of this handle was removed.

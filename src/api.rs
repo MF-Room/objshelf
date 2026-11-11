@@ -1,4 +1,4 @@
-//! The public API: [`TierMem`], and the functions that use it through anything that locks one.
+//! The public API: [`ObjShelf`], and the functions that use it through anything that locks one.
 //! The engine behind it is in `memory`.
 
 use alloc::string::String;
@@ -17,26 +17,26 @@ use crate::{Error, Handle, Storable};
 /// [`get_or_insert_with`] return a typed [`Handle`], and every access to an object goes through a
 /// closure given to [`with`] or [`with_mut`], so no reference to it escapes.
 ///
-/// The functions take the memory as `mem`: anything that locks a `TierMem`, such as RTIC's
-/// resource proxy (`&mut cx.shared.mem`). An owned `TierMem` is its own lock, so they also take
+/// The functions take the memory as `mem`: anything that locks an `ObjShelf`, such as RTIC's
+/// resource proxy (`&mut cx.shared.mem`). An owned `ObjShelf` is its own lock, so they also take
 /// `&mut mem` directly, as in `init` before it is shared.
 ///
 /// ```ignore
 /// // in `init`: when the changes fill the RAM budget, the `save` task is spawned to flush them
 /// let config = NorConfig { flash, range };
-/// let mut mem = TierMem::<NorBackend<Flash>>::mount(config, 16 * 1024, || {
+/// let mut mem = ObjShelf::<NorBackend<Flash>>::mount(config, 16 * 1024, || {
 ///     save::spawn().ok();
 /// })?;
 /// let handle: Handle<Settings> =
-///     tiermem::get_or_insert_with(&mut mem, "settings", Settings::default)?.expect("fits");
+///     objshelf::get_or_insert_with(&mut mem, "settings", Settings::default)?.expect("fits");
 ///
 /// // in a task with `shared = [mem]`: `None` means "not now, try again later"
 /// let mem = &mut cx.shared.mem;
-/// if let Some(brightness) = tiermem::with(mem, &handle, |s| s.brightness)? { /* ... */ }
-/// if tiermem::with_mut(mem, &handle, |s| s.brightness = 3)?.is_none() { /* try again later */ }
+/// if let Some(brightness) = objshelf::with(mem, &handle, |s| s.brightness)? { /* ... */ }
+/// if objshelf::with_mut(mem, &handle, |s| s.brightness = 3)?.is_none() { /* try again later */ }
 ///
 /// // in the `save` task, of the lowest priority
-/// tiermem::flush(&mut cx.shared.mem)?; // the changes go to the backend
+/// objshelf::flush(&mut cx.shared.mem)?; // the changes go to the backend
 /// ```
 ///
 /// # Writes
@@ -98,11 +98,11 @@ use crate::{Error, Handle, Storable};
 /// power cut during a flush leaves each object either as it was or as written, with its name: an
 /// object replaced by a new one of the same name ([`remove`], then [`insert`]) stays until the new
 /// one is written, and the next mount keeps the newer one if both are left.
-pub struct TierMem<B: Backend> {
+pub struct ObjShelf<B: Backend> {
     pub(crate) core: Core<B>,
 }
 
-impl<B: Backend> TierMem<B> {
+impl<B: Backend> ObjShelf<B> {
     /// Mounts the backend and reads the names of the objects, blocking until done. Objects in RAM take
     /// about `cache_bytes`, and `on_full` is called when the changes not flushed yet fill them
     /// (see [RAM budget](Self#ram-budget)). It runs inside the lock: keep it short, as spawning
@@ -127,7 +127,7 @@ impl<B: Backend> TierMem<B> {
 }
 
 /// With exclusive access, nothing else can reach the memory: locking it is free.
-impl<B: Backend> Mutex for TierMem<B> {
+impl<B: Backend> Mutex for ObjShelf<B> {
     type T = Self;
 
     fn lock<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -136,7 +136,7 @@ impl<B: Backend> Mutex for TierMem<B> {
 }
 
 /// Names of all the stored objects, in no particular order.
-pub fn list<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Vec<String> {
+pub fn list<B: Backend>(mem: &mut impl Mutex<T = ObjShelf<B>>) -> Vec<String> {
     Locked(mem).list()
 }
 
@@ -145,7 +145,7 @@ pub fn list<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Vec<String> {
 /// `T` must be the type the object was inserted with. Returns [`Error::NotFound`] if there is no
 /// object with this name.
 pub fn get<T: Storable, B: Backend>(
-    mem: &mut impl Mutex<T = TierMem<B>>,
+    mem: &mut impl Mutex<T = ObjShelf<B>>,
     name: &str,
 ) -> Result<Handle<T>, Error<B::Error>> {
     let id = Locked(mem).get(name).ok_or(Error::NotFound)?;
@@ -158,9 +158,9 @@ pub fn get<T: Storable, B: Backend>(
 /// Returns [`Error::AlreadyExists`] if an object with this name exists, [`Error::NameTooLong`] if
 /// `name` is longer than [`MAX_NAME_LEN`](crate::MAX_NAME_LEN) bytes, `Ok(None)` if the changes
 /// not flushed yet leave no room for it, and [`Error::TooBig`] if it is bigger than the whole
-/// budget (see [RAM budget](TierMem#ram-budget)).
+/// budget (see [RAM budget](ObjShelf#ram-budget)).
 pub fn insert<T: Storable, B: Backend>(
-    mem: &mut impl Mutex<T = TierMem<B>>,
+    mem: &mut impl Mutex<T = ObjShelf<B>>,
     name: &str,
     value: T,
 ) -> Result<Option<Handle<T>>, Error<B::Error>> {
@@ -173,7 +173,7 @@ pub fn insert<T: Storable, B: Backend>(
 ///
 /// `T` must be the type the object was inserted with.
 pub fn get_or_insert_with<T: Storable, B: Backend>(
-    mem: &mut impl Mutex<T = TierMem<B>>,
+    mem: &mut impl Mutex<T = ObjShelf<B>>,
     name: &str,
     f: impl FnOnce() -> T,
 ) -> Result<Option<Handle<T>>, Error<B::Error>> {
@@ -191,7 +191,7 @@ pub fn get_or_insert_with<T: Storable, B: Backend>(
 ///
 /// Returns [`Error::NotFound`] if it is already removed.
 pub fn remove<T: Storable, B: Backend>(
-    mem: &mut impl Mutex<T = TierMem<B>>,
+    mem: &mut impl Mutex<T = ObjShelf<B>>,
     handle: Handle<T>,
 ) -> Result<(), Error<B::Error>> {
     Locked(mem).remove(handle.id)
@@ -199,9 +199,9 @@ pub fn remove<T: Storable, B: Backend>(
 
 /// Runs `f` on the object of `handle` and returns its result. Reads the object if it is not in
 /// RAM, or returns `Ok(None)` without running `f` if a flush has the storage (see
-/// [Not now](TierMem#not-now-oknone)).
+/// [Not now](ObjShelf#not-now-oknone)).
 pub fn with<T: Storable, R, B: Backend>(
-    mem: &mut impl Mutex<T = TierMem<B>>,
+    mem: &mut impl Mutex<T = ObjShelf<B>>,
     handle: &Handle<T>,
     f: impl FnOnce(&T) -> R,
 ) -> Result<Option<R>, Error<B::Error>> {
@@ -214,9 +214,9 @@ pub fn with<T: Storable, R, B: Backend>(
 ///
 /// Returns `Ok(None)` without running `f` if a flush has the storage and the object is not in
 /// RAM, or if the changes not flushed yet leave no room for this object, and [`Error::TooBig`]
-/// if it is bigger than the whole budget (see [RAM budget](TierMem#ram-budget)).
+/// if it is bigger than the whole budget (see [RAM budget](ObjShelf#ram-budget)).
 pub fn with_mut<T: Storable, R, B: Backend>(
-    mem: &mut impl Mutex<T = TierMem<B>>,
+    mem: &mut impl Mutex<T = ObjShelf<B>>,
     handle: &Handle<T>,
     f: impl FnOnce(&mut T) -> R,
 ) -> Result<Option<R>, Error<B::Error>> {
@@ -227,7 +227,7 @@ pub fn with_mut<T: Storable, R, B: Backend>(
 ///
 /// The changes not flushed yet are not counted: modified objects count with their stored size,
 /// and new ones not at all.
-pub fn usage<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Usage {
+pub fn usage<B: Backend>(mem: &mut impl Mutex<T = ObjShelf<B>>) -> Usage {
     Locked(mem).usage()
 }
 
@@ -239,7 +239,7 @@ pub fn usage<B: Backend>(mem: &mut impl Mutex<T = TierMem<B>>) -> Usage {
 /// others and the removals are still done, so that one object failing at every flush does not
 /// block them: the first error is returned at the end.
 pub fn flush<B: Backend>(
-    mem: &mut impl Mutex<T = TierMem<B>>,
+    mem: &mut impl Mutex<T = ObjShelf<B>>,
 ) -> Result<Option<()>, Error<B::Error>> {
     Locked(mem).flush()
 }
@@ -251,7 +251,7 @@ pub fn flush<B: Backend>(
 /// storage, as [`flush`] does. Objects that must stay consistent with each other should be
 /// flushed together, with [`flush`].
 pub fn flush_object<T: Storable, B: Backend>(
-    mem: &mut impl Mutex<T = TierMem<B>>,
+    mem: &mut impl Mutex<T = ObjShelf<B>>,
     handle: &Handle<T>,
 ) -> Result<Option<()>, Error<B::Error>> {
     Locked(mem).flush_object(handle.id)
