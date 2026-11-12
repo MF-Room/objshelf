@@ -1,7 +1,7 @@
 # objshelf
 
-Software-managed object memory for embedded Rust, with typed access, transparent residency, and pluggable
-storage backends.
+A portable object store that caches plain Rust values on the heap, over pluggable backends from bare-metal to
+hosted systems.
 
 Objects have a name and a type. They are read from flash on first use and kept in RAM within a budget.
 Changes stay in RAM until you flush them, so the slow flash writes only happen when and where you choose.

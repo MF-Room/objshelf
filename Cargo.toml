@@ -2,7 +2,7 @@
 name = "objshelf"
 version = "0.1.0"
 edition = "2024"
-description = "Software-managed object memory for embedded Rust, with typed access, transparent residency, and pluggable storage backends."
+description = "A portable object store that caches plain Rust values on the heap, over pluggable backends from bare-metal to hosted systems."
 
 [dependencies]
 crc = "3.4.0"
