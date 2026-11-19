@@ -64,9 +64,7 @@ impl<F: NorFlash> NorBackend<F> {
                 count: header_count,
                 len: chunk.len() as u16,
             };
-            let page = self.alloc_page()?;
-            let addr = self.page_addr(page);
-            self.program(addr, &header.encode(chunk))?;
+            let page = self.write_page(&header.encode(chunk))?;
             pages.push(page as u16);
         }
 

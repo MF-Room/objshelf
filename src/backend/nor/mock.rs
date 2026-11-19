@@ -50,6 +50,8 @@ pub(crate) struct MockFlash<const ERASE_SIZE: usize> {
     dead: bool,
     /// Runs at the start of each program operation, as an interrupt during a write.
     pub(crate) on_write: Option<Box<dyn FnMut() + Send>>,
+    /// Worn pages: their byte 0 no longer programs and stays `0xFF`.
+    pub(super) worn: Vec<usize>,
     /// Gets a copy of the data when the power is cut (see `copy_on_cut`).
     left: Option<Arc<Mutex<Vec<u8>>>>,
 }
@@ -68,6 +70,7 @@ impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
             cut: None,
             dead: false,
             on_write: None,
+            worn: Vec::new(),
             left: None,
         }
     }
@@ -194,6 +197,9 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
             self.cut_write = Some(offset);
         }
         for at in part(range.clone(), cut) {
+            if at % PAGE_SIZE == 0 && self.worn.contains(&(at / PAGE_SIZE)) {
+                continue;
+            }
             self.data[at] &= bytes[at - range.start];
         }
         self.end(cut)

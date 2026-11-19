@@ -34,16 +34,21 @@ impl<F: NorFlash> NorBackend<F> {
         let mut max_version = None;
         // Newest version seen in each sector, to find the sector written last.
         let mut newest = vec![None; self.sectors.len()];
+        let mut headerless = Vec::new();
+        let (mut erase_sum, mut headers) = (0u64, 0u64);
 
         for (sector, newest) in newest.iter_mut().enumerate() {
             let bytes = self.read_page(sector * Self::PAGES_PER_SECTOR)?;
             let Some(header) = SectorHeader::decode(&bytes) else {
+                headerless.push(sector);
                 continue;
             };
             if header.version != FORMAT_VERSION {
                 return Err(NorError::UnsupportedFormat(header.version));
             }
             self.sectors[sector].erase_count = header.erase_count;
+            erase_sum += u64::from(header.erase_count);
+            headers += 1;
             if header.retired {
                 continue;
             }
@@ -114,6 +119,15 @@ impl<F: NorFlash> NorBackend<F> {
             self.mark_obsolete(page)?;
         }
 
+        // A sector without a header lost its erase count to a cut erase, or was never formatted.
+        // At 0, it would pass for the least worn sector and be opened again and again until its
+        // count caught up: it gets the average count instead.
+        if let Some(average) = erase_sum.checked_div(headers) {
+            for sector in headerless {
+                self.sectors[sector].erase_count = average as u32;
+            }
+        }
+
         // Keep allocating where the last write happened; close the other partly used sectors.
         self.active = (0..self.sectors.len())
             .filter(|&s| {
@@ -132,7 +146,8 @@ impl<F: NorFlash> NorBackend<F> {
 
     /// Writes the object `id` again, to new pages, as the power was cut while one of its pages
     /// may have been written: the page can read right, with weak bits that flip later (see
-    /// `scan`). Does nothing if the object is gone, does not fit (`NoSpace`) or reads `Corrupt`.
+    /// `scan`). Does nothing if the object is gone, reads `Corrupt`, does not fit (`NoSpace`) or
+    /// can't be written (`VerifyFailed`): it keeps the pages it has.
     pub(super) fn rewrite(&mut self, id: ObjectId) -> Result<(), NorError<F::Error>> {
         if !self.objects.contains_key(&id) {
             return Ok(());
@@ -141,7 +156,7 @@ impl<F: NorFlash> NorBackend<F> {
             .read_data(id)
             .and_then(|data| self.write_data(id, &data));
         match result {
-            Err(NorError::NoSpace | NorError::Corrupt) => Ok(()),
+            Err(NorError::NoSpace | NorError::Corrupt | NorError::VerifyFailed) => Ok(()),
             result => result,
         }
     }

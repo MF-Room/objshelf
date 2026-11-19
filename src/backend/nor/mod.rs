@@ -6,6 +6,17 @@
 //! Replaced and removed pages are marked obsolete. Garbage collection relocates the live pages of
 //! the sector with the most garbage, then erases it.
 //!
+//! # Wear
+//!
+//! - New pages go to the least worn free sector (dynamic wear leveling).
+//! - Static wear leveling: a sector whose data never changes is never garbage collected, so it
+//!   stops wearing. When the least worn sector holding data is `WEAR_GAP` (100) erases behind the
+//!   most worn sector, garbage collection moves its data to the most worn free sector and erases
+//!   it. It is then the least worn free sector, so the next one opened. The erase counts of
+//!   sectors holding data stay within about `WEAR_GAP` of each other.
+//! - A sector found without a header at mount (an erase cut by a power loss) gets the average
+//!   erase count of the others.
+//!
 //! # Requirements
 //!
 //! - **Heap**: `alloc` and a global allocator (index, page lists, serialized objects).
@@ -28,6 +39,11 @@
 //! - A page write cut by a power loss can leave weak bits: the page reads right, then turns
 //!   `Corrupt` later. When the cut hit an update or a garbage collection, mount sees it and writes
 //!   the object again. When it hit the very end of an object's first write, nothing tells.
+//! - Every page and sector header is read back right after its write, while the data is still in
+//!   RAM. A page that reads back wrong is marked obsolete and written again on the next free
+//!   page. A sector header that reads back wrong leaves its sector unformatted, and the least
+//!   worn free sector is picked again. After 3 tries, the write fails with
+//!   [`NorError::VerifyFailed`].
 //! - Each sector header holds the version of the on-flash format: mount fails with
 //!   [`NorError::UnsupportedFormat`] on a sector of another version, instead of erasing it as
 //!   unformatted.
@@ -41,19 +57,24 @@
 //! |---|---|---|
 //! | `mount` | reads all `N` pages; after a crash, one 1-byte write per stale page and a `write` of each object that had some | `O(N + S)` |
 //! | `read` | `k` page reads | `O(len)` |
-//! | `write`, no GC | `k` blank-check reads, `k` page writes, `k'` 1-byte writes | `O(len + S)` |
+//! | `write`, no GC | `k` blank-check reads, `k` page writes, `k` read-backs, `k'` 1-byte writes | `O(len + S)` |
 //! | `remove` | `k'` 1-byte writes | `O(k')` |
 //! | `usage` | none | `O(S)` |
-//! | GC, per sector reclaimed | up to `2 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 2 small writes | `O(S + P)` |
+//! | GC, per sector reclaimed | up to `3 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 2 small writes, 1 small read | `O(S + P)` |
 //!
-//! Hash map operations are expected `O(1)`. Garbage collection only runs inside a `write` that
-//! lacks space, possibly for several sectors. Opening a sector without a header also erases it,
-//! even if it reads blank: an erase cut by a power loss can leave cells that read `0xFF` but are
-//! not fully erased, and nothing tells them apart from a sector never used. So on a fresh chip,
-//! the first writes erase each sector once, and mount reads only page 0 of each sector.
+//! A page that reads back wrong costs one more page: a blank check, a write, a read-back and a
+//! 1-byte write. Hash map operations are expected `O(1)`.
+//!
+//! Garbage collection only runs inside a `write` that lacks space, possibly for several sectors.
+//! When the wear gets uneven, it also moves one sector of data that never changes: the cost of
+//! reclaiming a sector, once more. Opening a sector without a header also erases it, even if it
+//! reads blank: an erase cut by a power loss can leave cells that read `0xFF` but are not fully
+//! erased, and nothing tells them apart from a sector never used. So on a fresh chip, the first
+//! writes erase each sector once, and mount reads only page 0 of each sector.
 //!
 //! On the W25Q16JV at 25 MHz: page read ≈ 0.1 ms, page write 0.4 ms (3 ms max), sector erase
-//! 45 ms (400 ms max), mount of 2 MiB ≈ 0.7 s of SPI reads.
+//! 45 ms (400 ms max), mount of 2 MiB ≈ 0.7 s of SPI reads. The read-back adds about 25% to a
+//! typical page write.
 //!
 //! # Space
 //!
@@ -97,6 +118,15 @@ use layout::{MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE};
 /// Free sectors kept so garbage collection always has room to relocate live pages.
 const RESERVED_SECTORS: usize = 1;
 
+/// Static wear leveling: when the least worn sector holding data is this many erases behind the
+/// most worn sector, garbage collection moves its data to the most worn free sector. A lower gap
+/// spreads the wear more evenly, at the cost of more moves.
+const WEAR_GAP: u32 = 100;
+
+/// Pages tried for one page of data, and sectors for one sector header, when they read back wrong
+/// after their write, before giving up with [`NorError::VerifyFailed`].
+const WRITE_ATTEMPTS: usize = 3;
+
 /// Configuration of a [`NorBackend`].
 pub struct NorConfig<F> {
     /// Flash driver.
@@ -123,6 +153,10 @@ pub enum NorError<E> {
     /// A sector holds another version of the on-flash format, the one given, written by other
     /// firmware: the mount fails without erasing anything.
     UnsupportedFormat(u16),
+    /// A page of data read back wrong right after its write on 3 pages in a row, or a sector
+    /// header in 3 sectors: the flash is probably worn out. Nothing was replaced: the object keeps
+    /// its previous value.
+    VerifyFailed,
 }
 
 /// Current version of an object and its pages, in order.
@@ -169,8 +203,9 @@ impl<F: NorFlash> NorBackend<F> {
         page / Self::PAGES_PER_SECTOR
     }
 
-    /// Erase count of each sector of the region, in address order. A sector whose header was lost
-    /// (an erase cut by a power loss) restarts at 0.
+    /// Erase count of each sector of the region, in address order. A sector found without a header
+    /// at mount (an erase cut by a power loss, or never formatted) gets the average count of the
+    /// sectors with one.
     pub fn erase_counts(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
         self.sectors.iter().map(|s| s.erase_count)
     }
@@ -195,6 +230,16 @@ impl<F: NorFlash> NorBackend<F> {
 
     fn program(&mut self, addr: u32, bytes: &[u8]) -> Result<(), NorError<F::Error>> {
         self.flash.write(addr, bytes).map_err(NorError::Flash)
+    }
+
+    /// Programs `bytes`, within one page, then reads them back. `false` if they differ: cells
+    /// that did not program, as in a worn sector.
+    fn program_checked(&mut self, addr: u32, bytes: &[u8]) -> Result<bool, NorError<F::Error>> {
+        self.program(addr, bytes)?;
+        let mut back = [0; PAGE_SIZE];
+        let back = &mut back[..bytes.len()];
+        self.flash.read(addr, back).map_err(NorError::Flash)?;
+        Ok(back == bytes)
     }
 
     fn mark_obsolete(&mut self, page: usize) -> Result<(), NorError<F::Error>> {

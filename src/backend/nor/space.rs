@@ -2,8 +2,8 @@
 
 use embedded_storage::nor_flash::NorFlash;
 
-use super::layout::{SectorHeader, is_blank};
-use super::{NorBackend, NorError, RESERVED_SECTORS, Sector};
+use super::layout::{MARKER_OFFSET, SectorHeader, is_blank};
+use super::{NorBackend, NorError, RESERVED_SECTORS, Sector, WRITE_ATTEMPTS};
 
 impl<F: NorFlash> NorBackend<F> {
     /// Allocated pages that hold no live data.
@@ -12,7 +12,7 @@ impl<F: NorFlash> NorBackend<F> {
         sector.next_page - 1 - sector.live
     }
 
-    fn is_free(&self, sector: usize) -> bool {
+    pub(super) fn is_free(&self, sector: usize) -> bool {
         let s = &self.sectors[sector];
         self.active != Some(sector) && (!s.formatted || s.next_page == 1)
     }
@@ -34,8 +34,9 @@ impl<F: NorFlash> NorBackend<F> {
         }
     }
 
-    /// Erases a sector and writes its header.
-    pub(super) fn erase_sector(&mut self, sector: usize) -> Result<(), NorError<F::Error>> {
+    /// Erases a sector and writes its header, then reads the header back. Returns `false` if it
+    /// reads back wrong: the sector stays free and unformatted, to be erased again before use.
+    pub(super) fn erase_sector(&mut self, sector: usize) -> Result<bool, NorError<F::Error>> {
         let addr = self.sector_addr(sector);
         let erase_count = self.sectors[sector].erase_count.saturating_add(1);
         self.sectors[sector] = Sector {
@@ -47,27 +48,55 @@ impl<F: NorFlash> NorBackend<F> {
         self.flash
             .erase(addr, addr + F::ERASE_SIZE as u32)
             .map_err(NorError::Flash)?;
-        self.program(addr, &SectorHeader::encode(erase_count))?;
-        self.sectors[sector].formatted = true;
-        Ok(())
+        let formatted = self.program_checked(addr, &SectorHeader::encode(erase_count))?;
+        self.sectors[sector].formatted = formatted;
+        Ok(formatted)
     }
 
-    /// Makes the least worn free sector the active one.
+    /// Makes the least worn free sector the active one. If its header reads back wrong, the least
+    /// worn free sector is picked again: the failed one now counts one more erase.
     fn open_sector(&mut self) -> Result<usize, NorError<F::Error>> {
-        let sector = (0..self.sectors.len())
-            .filter(|&s| self.is_free(s))
-            .min_by_key(|&s| self.sectors[s].erase_count)
-            .ok_or(NorError::NoSpace)?;
-        if !self.sectors[sector].formatted {
-            self.erase_sector(sector)?;
+        for _ in 0..WRITE_ATTEMPTS {
+            let sector = (0..self.sectors.len())
+                .filter(|&s| self.is_free(s))
+                .min_by_key(|&s| self.sectors[s].erase_count)
+                .ok_or(NorError::NoSpace)?;
+            if self.activate(sector)? {
+                return Ok(sector);
+            }
+        }
+        Err(NorError::VerifyFailed)
+    }
+
+    /// Makes `sector`, a free one, the active sector, erasing it first if it is not formatted.
+    /// Returns `false` if its header reads back wrong.
+    pub(super) fn activate(&mut self, sector: usize) -> Result<bool, NorError<F::Error>> {
+        if !self.sectors[sector].formatted && !self.erase_sector(sector)? {
+            return Ok(false);
         }
         self.active = Some(sector);
-        Ok(sector)
+        Ok(true)
+    }
+
+    /// Writes `bytes`, a data page without its marker, to a free page, and reads it back. A page
+    /// that reads back wrong is marked obsolete, and the write goes to the next free page.
+    /// Returns the page written.
+    pub(super) fn write_page(&mut self, bytes: &[u8]) -> Result<usize, NorError<F::Error>> {
+        debug_assert!(bytes.len() <= MARKER_OFFSET);
+        for _ in 0..WRITE_ATTEMPTS {
+            let page = self.alloc_page()?;
+            let addr = self.page_addr(page);
+            if self.program_checked(addr, bytes)? {
+                return Ok(page);
+            }
+            self.mark_obsolete(page)?;
+        }
+        Err(NorError::VerifyFailed)
     }
 
     /// Returns a fully erased page. Pages are allocated in order inside a sector and never
     /// reused before the sector is erased.
-    pub(super) fn alloc_page(&mut self) -> Result<usize, NorError<F::Error>> {
+    fn alloc_page(&mut self) -> Result<usize, NorError<F::Error>> {
         loop {
             let sector = match self.active {
                 Some(s) if self.sectors[s].next_page < Self::PAGES_PER_SECTOR => s,

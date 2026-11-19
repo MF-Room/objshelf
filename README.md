@@ -3,8 +3,9 @@
 A portable object store that caches plain Rust values on the heap, over pluggable backends from bare-metal to
 hosted systems.
 
-Objects have a name and a type. They are read from flash on first use and kept in RAM within a budget.
-Changes stay in RAM until you flush them, so the slow flash writes only happen when and where you choose.
+Objects have a name and a type. They are read from the storage backend on first use and kept in RAM within a
+budget. Changes stay in RAM until you flush them, so the writes to storage only happen when and where you
+choose.
 
 ## Quick start
 
@@ -83,9 +84,9 @@ fn init(cx: init::Context) -> (Shared, Local) {
 async fn app(mut cx: app::Context) {
     let settings = cx.local.settings;
     let mem = &mut cx.shared.mem;
-    // Reads the object from flash if it is not in RAM.
+    // Reads the object from the backend if it is not in RAM.
     let Some(brightness) = objshelf::with(mem, settings, |s| s.brightness).unwrap() else {
-        // Not in RAM, and a flush has the flash: try again later.
+        // Not in RAM, and a flush has the backend: try again later.
         return;
     };
     // Changes RAM only, until the next flush.
@@ -94,13 +95,13 @@ async fn app(mut cx: app::Context) {
         Some(()) => {
             save_settings::spawn(*settings).ok();
         }
-        // A flush has the flash, or unflushed changes fill the budget (`on_full` spawned
+        // A flush has the backend, or unflushed changes fill the budget (`on_full` spawned
         // `save`): try again later.
         None => {}
     }
 }
 
-// The tasks that write to the flash, at the lowest priority: every task above it keeps running
+// The tasks that write to the backend, at the lowest priority: every task above it keeps running
 // meanwhile. With the same priority, neither interrupts the other, so neither gets `None`.
 
 // Writes all the changes. Spawned by `on_full`: only a full flush frees the whole budget.
@@ -135,38 +136,38 @@ owned `ObjShelf`.
 | `insert(mem, name, value)` | Adds a new object and returns its handle. `AlreadyExists` if the name is taken, `NameTooLong` over 64 bytes (`MAX_NAME_LEN`). |
 | `get_or_insert_with(mem, name, f)` | Handle to the object `name`, inserting `f()` first if it doesn't exist (first boot). |
 | `remove(mem, handle)` | Removes the object. |
-| `with(mem, &handle, \|v\| ...)` | Runs the closure on the object and returns its result. Reads the object from flash first if it is not in RAM. |
+| `with(mem, &handle, \|v\| ...)` | Runs the closure on the object and returns its result. Reads the object from the backend first if it is not in RAM. |
 | `with_mut(mem, &handle, \|v\| ...)` | Same, with mutable access. The change stays in RAM until the next flush. |
 | `usage(mem)` | Space of the backend: capacity, used, free, reclaimable by garbage collection, number of objects. |
-| `flush(mem)` | Writes the changes to the flash: changed and new objects, each with its name, then the removals. |
+| `flush(mem)` | Writes the changes to the backend: changed and new objects, each with its name, then the removals. |
 | `flush_object(mem, &handle)` | Writes this object if it changed, with its name. The other changes, removals included, stay in RAM. |
 
 `with`, `with_mut`, `insert`, `get_or_insert_with`, `flush` and `flush_object` return `Ok(None)`, having
 done nothing, when the call can't be done now:
 
-* **Busy:** a flush has the flash, and the call needs it. That is `with` and `with_mut` on an object that is
-  not in RAM or is being written, and the flushes themselves. Only a task of a higher priority than the
+* **Busy:** a flush has the backend, and the call needs it. That is `with` and `with_mut` on an object that
+  is not in RAM or is being written, and the flushes themselves. Only a task of a higher priority than the
   flush, which interrupts it, can get it.
 * **Full:** unflushed changes fill the RAM budget, for `with_mut` and `insert` (and `get_or_insert_with`
   when it inserts). `on_full` was called to start a flush.
 
 The errors are `NotFound`, `AlreadyExists`, `NameTooLong` (over `MAX_NAME_LEN`), `WrongType` (the
 handle's type is not the object's), `TooBig` (the object alone is bigger than the RAM budget, so
-`with_mut` and `insert` can never take it) and `Backend` (the flash failed). When an object fails to
+`with_mut` and `insert` can never take it) and `Backend` (the backend failed). When an object fails to
 write, `flush` still writes the others and does the removals, and returns the first error: the object
 stays in RAM for the next flush.
 
 ## How it works
 
-* **Writes.** Only `flush`, `flush_object` and `unmount` write to the flash. A flush takes a few ms per
-  object, and hundreds of ms when NOR garbage collection erases a sector. It runs in the caller's task:
+* **Writes.** Only `flush`, `flush_object` and `unmount` write to the backend. On NOR flash, a flush takes a
+  few ms per object, and hundreds of ms when garbage collection erases a sector. It runs in the caller's task:
   call it from a task of the lowest priority, so that every other task keeps running.
 * **Locking.** Each function takes the lock of `mem` for short steps only: never call them inside
   `cx.shared.mem.lock(...)`. The lock blocks the tasks that share `mem`, up to the highest priority among
   them, and no other task. It is held for RAM work, for the closures given to `with` and `with_mut` (keep
   them short), and for the read of an object not in RAM (about 85 µs per 256-byte page of SPI NOR at
   25 MHz). The writes of a flush run outside of it.
-* **Busy flash.** While a flush has the flash, objects in RAM keep working; `with` and `with_mut` return
+* **Busy backend.** While a flush has the backend, objects in RAM keep working; `with` and `with_mut` return
   `None` for the others. A task at the flush's priority or below never sees it: it can't run during the
   flush.
 * **RAM budget.** Each object in RAM counts its size, what it owns on the heap (measured with `GetSize`,
@@ -175,10 +176,10 @@ stays in RAM for the next flush.
   when needed. Changed objects stay until a flush; when one more would not fit, the call calls `on_full`
   and returns `None`. An object bigger than the whole budget gets `TooBig` instead: no flush can make
   room for it.
-* **Durability.** Changes, inserts and removals reach the flash on `flush` or `unmount`, or on
+* **Durability.** Changes, inserts and removals reach the backend on `flush` or `unmount`, or on
   `flush_object` for one object: a reset loses the rest. A power cut during a flush leaves each object
   either as it was or as written, with its name. An object replaced by a new one of the same name
-  (`remove`, then `insert`) stays on flash until the new one is written, and mount keeps the newer one if
+  (`remove`, then `insert`) stays stored until the new one is written, and mount keeps the newer one if
   both are left: the name never ends up with no object or two. Objects that must stay consistent with
   each other should be flushed together, with `flush`.
 * **Names and types.** Each object is stored with its name, and mount reads the names from the objects:
@@ -187,9 +188,9 @@ stays in RAM for the next flush.
   be read with the type it was inserted with. A cached object of another type gives `WrongType`, but the
   backend does not check types yet (see TODO).
 * **Limits.** An object must fit in the RAM budget (`TooBig` otherwise) and, serialized with its name,
-  in the free flash: at most 65535 pages of 235 bytes (about 15 MiB) on NOR. An object that doesn't fit
-  fails its flush with `NoSpace`, and the flush goes on with the others. A read or write also holds the
-  whole serialized object on the heap while it runs. The NOR region is aligned to the erase size, has at
+  in the free space of the backend: at most 65535 pages of 235 bytes (about 15 MiB) on NOR. An object that
+  doesn't fit fails its flush with `NoSpace`, and the flush goes on with the others. A read or write also
+  holds the whole serialized object on the heap while it runs. The NOR region is aligned to the erase size, has at
   least 2 sectors (one stays free for garbage collection) and at most 16 MiB, and is used by nothing
   else. Each write of an object gets the next number of a `u32` counter, and mount keeps the copy with
   the highest one. The flash wears out before that counter can wrap: each write programs at least one
@@ -216,6 +217,15 @@ in [`src/memory`](src/memory/mod.rs).
 * Every byte is programmed once between erases, and only from `0xFF`.
 * Garbage collection relocates the live pages of the sector with the most garbage and erases it; one free
   sector is kept for it. Ties go to the least worn sector.
+* Wear: new pages go to the least worn free sector. Data that never changes would keep its sector out
+  of the rotation, so when the least worn sector holding data is 100 erases behind the most worn one,
+  garbage collection moves its data to the most worn free sector and erases it (static wear
+  leveling). A sector found without a header at mount (an erase cut by a power loss) gets the average
+  erase count of the others instead of 0, so it is not reused first again and again.
+* Each page and sector header is read back right after its write, while the data is still in RAM. A page
+  that reads back wrong is marked obsolete and written again on the next free page; a sector header
+  that reads back wrong leaves the sector unformatted, and another sector is opened. After 3 tries the
+  write fails with `VerifyFailed`, and the object keeps its previous value.
 * Mount reads the whole region and rebuilds the index (2 MiB at 25 MHz: about 0.7 s).
 
 Requirements, guarantees, time and space complexity: module documentation in
@@ -224,13 +234,16 @@ Requirements, guarantees, time and space complexity: module documentation in
 ## TODO
 
 - [x] Reuse a store crate (`sequential-storage`, `ekv`, `littlefs2`) or write one: own store
-- [ ] When to run garbage collection. Today it only runs inside a `write` that lacks space, so that write
-  also pays for relocations and erases (up to 400 ms per sector). Options: run it in idle time,
-  pre-erase free sectors, trigger on a garbage threshold, bound the work done per call.
-- [ ] Wear leveling. Today: the least worn free sector is opened next, and ties between GC victims go to
-  the least worn sector. Missing: static wear leveling (sectors holding data that never changes are
-  never erased), an erase count kept across a sector header lost to an interrupted erase (it restarts
-  at 0), a lifetime estimate for the expected write rate.
+- [x] When to run garbage collection: only a flush writes, so it only runs inside a flush, in the
+  lowest-priority task. Its erases (up to 400 ms per sector) never block a higher-priority task: objects in
+  RAM keep working, and the others return `None` until the flush ends.
+- [x] Wear leveling: the least worn free sector is opened next, ties between GC victims go to the least
+  worn sector, static wear leveling in the GC (data that never changes moves once its sector is 100
+  erases behind), and a sector header lost to an interrupted erase gets the average erase count
+- [ ] Lifetime estimate for the expected write rate: a wear-out limit in the simulated flash to
+  measure it, and the remaining life from `erase_counts()` at runtime
+- [x] Read back each page and sector header after its write, and write it again elsewhere if it reads
+  back wrong (`VerifyFailed` after 3 tries)
 - [x] Format version in the sector header: mount fails on another version instead of erasing it
 - [ ] Edge cases:
   - after a flash error, the RAM state may not match the flash: define the rule (remount?)
@@ -238,7 +251,8 @@ Requirements, guarantees, time and space complexity: module documentation in
     or weak bits after a cut at the very end of an object's first write (an update or a garbage
     collection cut that way is written again at mount)
   - a corrupted sector header makes mount ignore the whole sector and its objects
-  - skipped dirty pages can eat into the GC reserve; GC refuses a victim whose live pages don't fit
+  - skipped dirty pages, and pages that read back wrong, can eat into the GC reserve; GC refuses a
+    victim whose live pages don't fit
   - peak RAM: `write` and `read` hold the whole serialized object, plus the page list
 - [x] Implement `ObjShelf` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names
   stored with the objects, LRU read cache with a RAM budget, changes kept in RAM until a flush
