@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 use rtic_core::Mutex;
 
-use crate::backend::{Backend, Usage};
+use crate::backend::{Backend, Usage, Wear};
 use crate::{ObjShelf, ObjectId};
 use cache::Entry;
 
@@ -44,6 +44,8 @@ pub(crate) struct Core<B: Backend> {
     backend: Option<B>,
     /// How the backend's space is used, as of the last storage operation.
     usage: Usage,
+    /// How worn the backend's storage is, as of the last storage operation.
+    wear: Option<Wear>,
 
     // Names (`names.rs`). The backend stores each one with its object.
     directory: BTreeMap<String, ObjectId>,
@@ -77,6 +79,10 @@ impl<B: Backend, M: Mutex<T = ObjShelf<B>>> Locked<'_, M> {
     pub(crate) fn usage(&mut self) -> Usage {
         self.lock(|core| core.usage)
     }
+
+    pub(crate) fn wear(&mut self) -> Option<Wear> {
+        self.lock(|core| core.wear)
+    }
 }
 
 impl<B: Backend> Core<B> {
@@ -99,6 +105,7 @@ impl<B: Backend> Core<B> {
     /// Puts the backend back after a write.
     fn restore(&mut self, backend: B) {
         self.usage = backend.usage();
+        self.wear = backend.wear();
         self.backend = Some(backend);
     }
 }

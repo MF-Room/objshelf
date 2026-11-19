@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use rtic_core::Mutex;
 
-use crate::backend::{Backend, Usage};
+use crate::backend::{Backend, Usage, Wear};
 use crate::memory::{Core, Locked};
 use crate::{Error, Handle, Storable};
 
@@ -229,6 +229,12 @@ pub fn with_mut<T: Storable, R, B: Backend>(
 /// and new ones not at all.
 pub fn usage<B: Backend>(mem: &mut impl Mutex<T = ObjShelf<B>>) -> Usage {
     Locked(mem).usage()
+}
+
+/// How worn the backend's storage is (see [`Wear`]), as of the last storage operation. `None` if
+/// the backend doesn't track it: its storage doesn't wear out, or something else handles it.
+pub fn wear<B: Backend>(mem: &mut impl Mutex<T = ObjShelf<B>>) -> Option<Wear> {
+    Locked(mem).wear()
 }
 
 /// Writes the changes to the backend: the modified and new objects, each with its name, then the

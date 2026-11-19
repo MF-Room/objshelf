@@ -139,6 +139,7 @@ owned `ObjShelf`.
 | `with(mem, &handle, \|v\| ...)` | Runs the closure on the object and returns its result. Reads the object from the backend first if it is not in RAM. |
 | `with_mut(mem, &handle, \|v\| ...)` | Same, with mutable access. The change stays in RAM until the next flush. |
 | `usage(mem)` | Space of the backend: capacity, used, free, reclaimable by garbage collection, number of objects. |
+| `wear(mem)` | Wear of the storage (NOR flash): sectors, erases of the most worn one, all erases added up. `None` for storage that doesn't wear out. |
 | `flush(mem)` | Writes the changes to the backend: changed and new objects, each with its name, then the removals. |
 | `flush_object(mem, &handle)` | Writes this object if it changed, with its name. The other changes, removals included, stay in RAM. |
 
@@ -228,6 +229,34 @@ in [`src/memory`](src/memory/mod.rs).
   write fails with `VerifyFailed`, and the object keeps its previous value.
 * Mount reads the whole region and rebuilds the index (2 MiB at 25 MHz: about 0.7 s).
 
+### Lifetime
+
+A sector endures a limited number of erases (100 000 for the W25Q16JV), and wear leveling spreads
+them over all the sectors, so:
+
+```text
+lifetime ≈ sectors × endurance × pages written per erase / pages written per day
+```
+
+Each flush writes every modified object once, in pages of 235 bytes (name and value serialized).
+Pages written per erase depend on how full the flash is: a fuller flash leaves less garbage in each
+sector, so garbage collection moves more live pages for each erase. Measured with 4 KiB sectors and
+one-page objects updated at random (`cargo test --release -- --ignored --nocapture pages_per_erase`):
+
+| Flash full | Pages per erase | 1 page/s, whole W25Q16JV | 1 page/min, whole W25Q16JV |
+|---|---|---|---|
+| 25% or less | 15.0 | 24 years | 1 400 years |
+| 50% | 12.5 | 20 years | 1 200 years |
+| 75% | 7.5 | 12 years | 730 years |
+| 90% | 3.7 | 6 years | 360 years |
+
+So the region size and how full it is matter as much as how often you flush. At runtime,
+`wear(mem)` gives the erases so far, stored with the sectors, so they count across reboots. Read
+`total_erases` twice, some time apart, for the erase rate, then `remaining_erases(endurance)` / rate
+is the time left. When the sectors wear out, writes fail with `VerifyFailed` or `NoSpace` and what
+was written stays readable: on a simulated flash that wears out, the store used 87% of the page
+writes the flash could take before its first failed write.
+
 Requirements, guarantees, time and space complexity: module documentation in
 [`src/backend/nor/mod.rs`](src/backend/nor/mod.rs) (`cargo doc --document-private-items`).
 
@@ -240,8 +269,8 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [x] Wear leveling: the least worn free sector is opened next, ties between GC victims go to the least
   worn sector, static wear leveling in the GC (data that never changes moves once its sector is 100
   erases behind), and a sector header lost to an interrupted erase gets the average erase count
-- [ ] Lifetime estimate for the expected write rate: a wear-out limit in the simulated flash to
-  measure it, and the remaining life from `erase_counts()` at runtime
+- [x] Lifetime estimate: the formula and measured pages per erase (Lifetime), `wear(mem)` at
+  runtime, and an end-of-life test on a simulated flash that wears out
 - [x] Read back each page and sector header after its write, and write it again elsewhere if it reads
   back wrong (`VerifyFailed` after 3 tries)
 - [x] Format version in the sector header: mount fails on another version instead of erasing it
@@ -269,4 +298,5 @@ Requirements, guarantees, time and space complexity: module documentation in
   or a wrong decode
 - [x] Max name length: `MAX_NAME_LEN`, 64 bytes, `NameTooLong` from `insert`
 - [x] Max object size and flash region used by objshelf: documented (Limits)
-- [x] Host tests with a simulated `NorFlash` (power cuts, two geometries), `cargo test` in CI
+- [x] Host tests with a simulated `NorFlash` (power cuts, worn pages, wear-out, two geometries), `cargo test`
+  in CI

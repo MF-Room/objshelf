@@ -12,8 +12,8 @@ use get_size2::GetSize;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub use api::{
-    ObjShelf, flush, flush_object, get, get_or_insert_with, insert, list, remove, usage, with,
-    with_mut,
+    ObjShelf, flush, flush_object, get, get_or_insert_with, insert, list, remove, usage, wear,
+    with, with_mut,
 };
 /// The lock trait of RTIC 2 (`rtic::Mutex`): the functions of this crate take anything that
 /// implements it. Implement it to share an `ObjShelf` without RTIC.

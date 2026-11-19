@@ -45,6 +45,13 @@ pub trait Backend: Sized + 'static {
     /// How the storage space is used. Computed from the backend's RAM state, without I/O.
     fn usage(&self) -> Usage;
 
+    /// How worn the storage is (see [`Wear`]). Computed from the backend's RAM state, without
+    /// I/O. `None`, the default, for storage that doesn't wear out, or whose wear something else
+    /// handles (the OS for a file system).
+    fn wear(&self) -> Option<Wear> {
+        None
+    }
+
     /// Ids of all the stored objects, in no particular order. Computed from the backend's RAM
     /// state, without I/O.
     fn ids(&self) -> Vec<ObjectId>;
@@ -73,4 +80,39 @@ pub struct Usage {
     pub reclaimable: usize,
     /// Number of stored objects.
     pub objects: usize,
+}
+
+/// Wear of a storage erased in sectors, each enduring a limited number of erases: NOR flash.
+///
+/// The endurance is in the chip's datasheet: 100 000 erases per sector for the W25Q16JV. Wear
+/// leveling keeps the sectors within about 100 erases of each other, so the storage wears out
+/// when `total_erases` nears `sectors × endurance`. The backend has no clock: to estimate the time
+/// left, read `total_erases` twice, some time apart.
+///
+/// ```
+/// use objshelf::backend::Wear;
+///
+/// // Read a day apart.
+/// let yesterday = Wear { sectors: 512, most_worn: 120, total_erases: 51_000 };
+/// let today = Wear { sectors: 512, most_worn: 121, total_erases: 51_480 };
+/// let per_day = today.total_erases - yesterday.total_erases;
+/// let days_left = today.remaining_erases(100_000) / per_day;
+/// assert_eq!(days_left, 106_559); // about 290 years
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Wear {
+    /// Number of sectors.
+    pub sectors: u32,
+    /// Erases of the most worn sector.
+    pub most_worn: u32,
+    /// Erases of all the sectors added up. The counts are stored with the sectors, so this keeps
+    /// counting across reboots.
+    pub total_erases: u64,
+}
+
+impl Wear {
+    /// Erases left before every sector reaches `endurance`, the erases a sector is rated for.
+    pub fn remaining_erases(&self, endurance: u32) -> u64 {
+        (u64::from(self.sectors) * u64::from(endurance)).saturating_sub(self.total_erases)
+    }
 }

@@ -41,9 +41,13 @@ impl<F: NorFlash> NorBackend<F> {
     /// data moves to the most worn free sector, where it can stay, and it is erased: as the least
     /// worn free sector, it is the next one opened. Moves at most one sector.
     ///
-    /// Free space doesn't change: the data takes one free sector and frees another.
+    /// Free space doesn't change: the data takes one free sector and frees another. Only sectors
+    /// with a header count: one without may have worn out, its header failing to write.
     fn level_wear(&mut self) -> Result<(), NorError<F::Error>> {
-        let most_worn = self.sectors.iter().map(|s| s.erase_count).max();
+        let most_worn = (self.sectors.iter())
+            .filter(|s| s.formatted)
+            .map(|s| s.erase_count)
+            .max();
         let Some(cold) = (0..self.sectors.len())
             .filter(|&s| self.sectors[s].live > 0 && self.active != Some(s))
             .min_by_key(|&s| self.sectors[s].erase_count)
@@ -51,7 +55,7 @@ impl<F: NorFlash> NorBackend<F> {
             return Ok(());
         };
         let Some(target) = (0..self.sectors.len())
-            .filter(|&s| self.is_free(s))
+            .filter(|&s| self.is_free(s) && self.sectors[s].formatted)
             .max_by_key(|&s| self.sectors[s].erase_count)
         else {
             return Ok(());

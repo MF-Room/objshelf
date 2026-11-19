@@ -9,7 +9,7 @@ use super::layout::{FORMAT_VERSION, PAGE_SIZE, PageHeader};
 use super::mock::{Cut, MockError, MockFlash};
 use super::{NorBackend, NorConfig, NorError, WEAR_GAP};
 use crate::ObjectId;
-use crate::backend::{Backend, Usage};
+use crate::backend::{Backend, Usage, Wear};
 
 /// 1 KiB sectors: a header page and 3 data pages, so garbage collection runs often.
 type SmallFlash = MockFlash<1024>;
@@ -124,6 +124,12 @@ fn garbage_collection_reuses_space() {
     let counts: Vec<u32> = backend.erase_counts().collect();
     let (min, max) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
     assert!(max - min <= 2, "erase counts {counts:?}");
+    let wear = Wear {
+        sectors: 4,
+        most_worn: *max,
+        total_erases: counts.iter().map(|&count| u64::from(count)).sum(),
+    };
+    assert_eq!(backend.wear(), Some(wear));
 }
 
 #[test]
@@ -565,5 +571,83 @@ fn power_cut_while_static_data_moves() {
                 "cut {cut:?} at {at}"
             );
         }
+    }
+}
+
+#[test]
+fn a_worn_out_flash_fails_writes_and_keeps_the_data() {
+    let (sectors, limit) = (8, 30);
+    let mut flash = SmallFlash::new(sectors);
+    flash.erase_limit = Some(limit);
+    let mut backend = mount(flash);
+    // Object 9 never changes, objects 1 to 4 keep changing.
+    let mut expected = BTreeMap::new();
+    backend.write(ObjectId(9), "", &bytes(9, 600)).unwrap();
+    expected.insert(9, bytes(9, 600));
+    let mut writes = 0u32;
+    let error = loop {
+        let (id, value) = (1 + writes % 4, bytes(writes as u8, 100));
+        match backend.write(ObjectId(id), "", &value) {
+            Ok(()) => {
+                expected.insert(id, value);
+                writes += 1;
+            }
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(error, NorError::VerifyFailed | NorError::NoSpace),
+        "{error:?}"
+    );
+
+    // Every object keeps its last value written, before and after a reboot.
+    for (&id, value) in &expected {
+        assert_eq!(read(&mut backend, id).as_ref(), Some(value), "object {id}");
+    }
+    let mut backend = mount(backend.into_flash().rebooted());
+    for (&id, value) in &expected {
+        assert_eq!(read(&mut backend, id).as_ref(), Some(value), "object {id}");
+    }
+
+    // The wear was spread: the store used most of what the flash endures, one page per write at
+    // best (3 data pages per sector).
+    let best = sectors as u32 * limit * 3;
+    assert!(writes * 10 >= best * 7, "{writes} writes of {best} at best");
+}
+
+/// Pages written per sector erase with 4 KiB sectors, by how full the flash is, for one-page
+/// objects updated at random: the basis of the lifetime estimate in the README. Prints a table:
+/// `cargo test --release -- --ignored --nocapture pages_per_erase`.
+#[test]
+#[ignore]
+fn pages_per_erase() {
+    let sectors = 64;
+    let capacity = (sectors - 1) * 15;
+    for percent in [10, 25, 50, 75, 90] {
+        let mut backend = mount(MockFlash::<4096>::new(sectors));
+        let objects = (capacity * percent / 100) as u32;
+        for id in 0..objects {
+            write(&mut backend, id, &bytes(id as u8, 200));
+        }
+        // xorshift32: the same updates on every run.
+        let mut state = 0x2545_F491u32;
+        let mut update = |backend: &mut NorBackend<MockFlash<4096>>| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            write(backend, state % objects, &bytes(state as u8, 200));
+        };
+        // Until the garbage collection runs at its steady pace.
+        for _ in 0..20_000 {
+            update(&mut backend);
+        }
+        let before = backend.wear().unwrap().total_erases;
+        let writes = 50_000;
+        for _ in 0..writes {
+            update(&mut backend);
+        }
+        let erases = backend.wear().unwrap().total_erases - before;
+        let per_erase = f64::from(writes) / erases as f64;
+        std::eprintln!("{percent:>3}% full: {per_erase:.1} pages written per erase");
     }
 }

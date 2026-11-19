@@ -16,6 +16,7 @@
 //!   sectors holding data stay within about `WEAR_GAP` of each other.
 //! - A sector found without a header at mount (an erase cut by a power loss) gets the average
 //!   erase count of the others.
+//! - [`Backend::wear`] reports the erase counts, for a lifetime estimate (README, Lifetime).
 //!
 //! # Requirements
 //!
@@ -111,7 +112,7 @@ use embedded_storage::nor_flash::NorFlash;
 use hashbrown::HashMap;
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::{Backend, Usage};
+use super::{Backend, Usage, Wear};
 use crate::ObjectId;
 use layout::{MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE};
 
@@ -347,5 +348,15 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
 
     fn ids(&self) -> Vec<ObjectId> {
         self.objects.keys().copied().collect()
+    }
+
+    /// From the erase counts of the sectors (see `erase_counts`).
+    fn wear(&self) -> Option<Wear> {
+        let counts = self.sectors.iter().map(|s| s.erase_count);
+        Some(Wear {
+            sectors: self.sectors.len() as u32,
+            most_worn: counts.clone().max().unwrap_or(0),
+            total_erases: counts.map(u64::from).sum(),
+        })
     }
 }

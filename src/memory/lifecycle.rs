@@ -22,6 +22,7 @@ impl<B: Backend> Core<B> {
         let next_id = directory.values().map(|id| id.0 + 1).max().unwrap_or(0);
         Ok(Self {
             usage: backend.usage(),
+            wear: backend.wear(),
             backend: Some(backend),
             directory,
             removed: Vec::new(),

@@ -15,7 +15,7 @@ use crate::backend::nor::mock::{Cut, MockError, MockFlash};
 use crate::backend::nor::{NorBackend, NorConfig, NorError};
 use crate::{
     Error, Handle, MAX_NAME_LEN, Mutex, ObjShelf, ObjectId, Storable, flush, flush_object, get,
-    get_or_insert_with, insert, list, remove, usage, with, with_mut,
+    get_or_insert_with, insert, list, remove, usage, wear, with, with_mut,
 };
 
 type Flash = MockFlash<1024>;
@@ -240,6 +240,27 @@ fn changes_reach_the_flash_on_flush() {
     let mut mem = mount(power_cut(mem), CACHE);
     assert_eq!(with(&mut mem, &a, |a| *a).unwrap().unwrap(), 3);
     mem.unmount().unwrap();
+}
+
+#[test]
+fn wear_follows_the_flushes() {
+    let mut mem = mount(Flash::new(4), CACHE);
+    // A fresh flash: no sector erased yet.
+    assert_eq!(wear(&mut mem).unwrap().total_erases, 0);
+    let a = insert(&mut mem, "a", vec![0u8; 100]).unwrap().unwrap();
+    let mut erases = 0;
+    for round in 0..30 {
+        with_mut(&mut mem, &a, |a| a[0] = round).unwrap().unwrap();
+        flush(&mut mem).unwrap().unwrap();
+        let worn = wear(&mut mem).unwrap();
+        assert_eq!(worn.sectors, 4);
+        assert!(worn.total_erases >= erases);
+        erases = worn.total_erases;
+    }
+    // Each sector holds 3 pages: 30 writes erased sectors again.
+    assert!(erases > 4, "{erases} erases");
+    let mut mem = mount(power_cut(mem), CACHE);
+    assert_eq!(wear(&mut mem).unwrap().total_erases, erases);
 }
 
 #[test]
