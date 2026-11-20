@@ -94,7 +94,7 @@ impl<B: Backend> Core<B> {
             return Ok(None);
         };
         let value = backend.read::<T>(id).map_err(Error::Backend)?;
-        self.cache(id, value, false);
+        self.cache(id, value.ok_or(Error::WrongType)?, false);
         Ok(Some(()))
     }
 

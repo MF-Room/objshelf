@@ -192,6 +192,29 @@ fn wrong_type() {
     assert!(matches!(changed, Err(Error::WrongType)));
 }
 
+/// After a reboot the object is not in RAM: the backend checks its type, so the handle used first
+/// doesn't decide. Without the check, `Settings::default()` decodes as an empty `Blob`.
+#[test]
+fn wrong_type_after_a_reboot() {
+    let mut mem = mount(Flash::new(8), CACHE);
+    insert(&mut mem, "settings", Settings::default())
+        .unwrap()
+        .unwrap();
+    flush(&mut mem).unwrap().unwrap();
+    let mut mem = mount(power_cut(mem), CACHE);
+    let wrong: Handle<Blob> = get(&mut mem, "settings").unwrap();
+    assert!(matches!(
+        with(&mut mem, &wrong, |b| b.0.len()),
+        Err(Error::WrongType)
+    ));
+    assert!(!is_cached(&mem, &wrong));
+    let right: Handle<Settings> = get(&mut mem, "settings").unwrap();
+    let read = with(&mut mem, &right, |s| s.clone()).unwrap();
+    assert_eq!(read, Some(Settings::default()));
+    let changed = with_mut(&mut mem, &wrong, |b| b.0.clear());
+    assert!(matches!(changed, Err(Error::WrongType)));
+}
+
 #[test]
 fn insert_and_remove_reach_the_flash_on_flush() {
     let mut mem = mount(Flash::new(8), CACHE);

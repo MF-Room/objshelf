@@ -1,8 +1,9 @@
 //! Object store on NOR flash.
 //!
-//! Objects are serialized with postcard, their name first, and split in 256-byte pages (see
-//! `layout`). Each write of an object gets a new global version, written to free pages. A version only counts once all its
-//! pages are on flash, so after a power cut an object holds either its old or its new value.
+//! Objects are serialized with postcard, their name and the 4-byte tag of their type first (see
+//! [`type_tag`]), and split in 256-byte pages (see `layout`). Each write of an object gets a new
+//! global version, written to free pages. A version only counts once all its pages are on flash,
+//! so after a power cut an object holds either its old or its new value.
 //! Replaced and removed pages are marked obsolete. Garbage collection relocates the live pages of
 //! the sector with the most garbage, then erases it.
 //!
@@ -90,8 +91,9 @@
 //! Flash: 235 payload bytes per 256-byte page, page 0 of each sector for its header, one sector
 //! kept free, at least one page per object. On a whole W25Q16JV (512 sectors) that is at most
 //! 511 × 15 × 235 B ≈ 1.72 MiB of live data. An update also needs room for its new version before
-//! the old one is released. An object, serialized with its name, takes at most 65535 pages
-//! (about 15 MiB) and must fit in the free space: `write` returns [`NorError::NoSpace`] otherwise.
+//! the old one is released. An object, serialized with its name and type tag, takes at most 65535
+//! pages (about 15 MiB) and must fit in the free space: `write` returns [`NorError::NoSpace`]
+//! otherwise.
 
 mod gc;
 mod layout;
@@ -112,7 +114,7 @@ use embedded_storage::nor_flash::NorFlash;
 use hashbrown::HashMap;
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::{Backend, Usage, Wear};
+use super::{Backend, Usage, Wear, type_tag};
 use crate::ObjectId;
 use layout::{MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE};
 
@@ -299,15 +301,21 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
         name: &str,
         value: &T,
     ) -> Result<(), Self::Error> {
-        let data = postcard::to_allocvec(&(name, value)).map_err(NorError::Serialization)?;
+        let tag = type_tag::<T>().to_le_bytes();
+        let data = postcard::to_allocvec(&(name, tag, value)).map_err(NorError::Serialization)?;
         self.write_data(id, &data)
     }
 
-    fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, Self::Error> {
+    fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<Option<T>, Self::Error> {
         let data = self.read_data(id)?;
-        let (_name, value): (&str, T) =
-            postcard::from_bytes(&data).map_err(NorError::Serialization)?;
-        Ok(value)
+        let ((_name, tag), value): ((&str, [u8; 4]), _) =
+            postcard::take_from_bytes(&data).map_err(NorError::Serialization)?;
+        if u32::from_le_bytes(tag) != type_tag::<T>() {
+            return Ok(None);
+        }
+        postcard::from_bytes(value)
+            .map(Some)
+            .map_err(NorError::Serialization)
     }
 
     /// Reads the pages of the object until its name is whole: the first one only, unless the name

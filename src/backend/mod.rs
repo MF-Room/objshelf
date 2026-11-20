@@ -10,7 +10,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::ObjectId;
 
 /// Persistent store of serialized objects, addressed by `ObjectId`. Each object holds its name,
-/// written with it, so the names are stored nowhere else.
+/// written with it, so the names are stored nowhere else, and the [`type_tag`] of its type.
 ///
 /// One operation runs at a time (`&mut self`), blocking until done.
 // `'static` because `ObjShelf` erases the types of the objects it caches, which names the backend.
@@ -23,9 +23,9 @@ pub trait Backend: Sized + 'static {
     /// Opens the storage and rebuilds the backend's state from what it holds.
     fn mount(config: Self::Config) -> Result<Self, Self::Error>;
 
-    /// Stores `value` under `id`, with its `name`, replacing any previous value. It is durable when
-    /// this returns. The name and the value are written at once: an object is never stored without
-    /// its name.
+    /// Stores `value` under `id`, with its `name` and `type_tag::<T>()`, replacing any previous
+    /// value. It is durable when this returns. The name and the value are written at once: an
+    /// object is never stored without its name.
     fn write<T: Serialize>(
         &mut self,
         id: ObjectId,
@@ -33,8 +33,10 @@ pub trait Backend: Sized + 'static {
         value: &T,
     ) -> Result<(), Self::Error>;
 
-    /// Reads the value stored under `id`. `T` must be the type it was written with.
-    fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<T, Self::Error>;
+    /// Reads the value stored under `id`: `None` if it was written with another type than `T`,
+    /// its stored tag not being `type_tag::<T>()`. The tag is checked before the value is
+    /// decoded.
+    fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<Option<T>, Self::Error>;
 
     /// Reads the name stored with the object `id`, without its value.
     fn name(&mut self, id: ObjectId) -> Result<String, Self::Error>;
@@ -60,6 +62,19 @@ pub trait Backend: Sized + 'static {
     fn unmount(self) -> Result<(), Self::Error> {
         Ok(())
     }
+}
+
+/// Tag of the type `T`, stored with each object so that reading it with another type is caught:
+/// a 32-bit FNV-1a hash of `core::any::type_name::<T>()`.
+///
+/// It changes when the type is renamed or moved to another module, and the compiler doesn't
+/// promise to keep type names the same across its versions: objects stored before such a change
+/// then read as another type. Changes inside the type (its fields) don't change the tag.
+pub fn type_tag<T: ?Sized>() -> u32 {
+    let name = core::any::type_name::<T>();
+    name.bytes().fold(0x811c_9dc5, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
 }
 
 /// Space of a backend, in bytes of serialized objects.

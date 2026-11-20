@@ -9,7 +9,7 @@ use super::layout::{FORMAT_VERSION, PAGE_SIZE, PageHeader};
 use super::mock::{Cut, MockError, MockFlash};
 use super::{NorBackend, NorConfig, NorError, WEAR_GAP};
 use crate::ObjectId;
-use crate::backend::{Backend, Usage, Wear};
+use crate::backend::{Backend, Usage, Wear, type_tag};
 
 /// 1 KiB sectors: a header page and 3 data pages, so garbage collection runs often.
 type SmallFlash = MockFlash<1024>;
@@ -31,7 +31,8 @@ fn write<const E: usize, T: Serialize>(backend: &mut NorBackend<MockFlash<E>>, i
 
 fn read<const E: usize>(backend: &mut NorBackend<MockFlash<E>>, id: u32) -> Option<Vec<u8>> {
     match backend.read(ObjectId(id)) {
-        Ok(value) => Some(value),
+        Ok(Some(value)) => Some(value),
+        Ok(None) => panic!("object {id} is stored with another type"),
         Err(NorError::NotFound) => None,
         Err(error) => panic!("reading object {id}: {error:?}"),
     }
@@ -60,9 +61,9 @@ fn round_trip_and_reboot() {
     write(&mut backend, 3, &());
 
     let mut backend = reboot(backend);
-    assert_eq!(backend.read::<Pattern>(ObjectId(1)).unwrap(), pattern);
+    assert_eq!(backend.read::<Pattern>(ObjectId(1)).unwrap(), Some(pattern));
     assert_eq!(read(&mut backend, 2), Some(bytes(7, 1000)));
-    backend.read::<()>(ObjectId(3)).unwrap();
+    assert_eq!(backend.read::<()>(ObjectId(3)).unwrap(), Some(()));
     assert_eq!(read(&mut backend, 4), None);
     for id in 1..=3 {
         assert_eq!(backend.name(ObjectId(id)).unwrap(), id.to_string());
@@ -77,7 +78,20 @@ fn a_name_longer_than_a_page() {
     backend.write(ObjectId(1), &name, &5u32).unwrap();
     let mut backend = reboot(backend);
     assert_eq!(backend.name(ObjectId(1)).unwrap(), name);
-    assert_eq!(backend.read::<u32>(ObjectId(1)).unwrap(), 5);
+    assert_eq!(backend.read::<u32>(ObjectId(1)).unwrap(), Some(5));
+}
+
+/// The tag is checked before the value is decoded: without it, the bytes of `5u32` decode as
+/// `-3i32`.
+#[test]
+fn reading_with_another_type_gives_none() {
+    let mut backend = mount(SmallFlash::new(4));
+    write(&mut backend, 1, &5u32);
+    let mut backend = reboot(backend);
+    assert_eq!(backend.read::<i32>(ObjectId(1)).unwrap(), None);
+    assert_eq!(backend.read::<u32>(ObjectId(1)).unwrap(), Some(5));
+    // Part of the stored format: another hash would make every stored object read as another type.
+    assert_eq!(type_tag::<u32>(), 0x05f3_74b1);
 }
 
 #[test]

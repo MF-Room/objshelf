@@ -142,8 +142,9 @@ pub fn list<B: Backend>(mem: &mut impl Mutex<T = ObjShelf<B>>) -> Vec<String> {
 
 /// Handle to the object `name`.
 ///
-/// `T` must be the type the object was inserted with. Returns [`Error::NotFound`] if there is no
-/// object with this name.
+/// `T` must be the type the object was inserted with: [`with`] and [`with_mut`] return
+/// [`Error::WrongType`] otherwise. Returns [`Error::NotFound`] if there is no object with this
+/// name.
 pub fn get<T: Storable, B: Backend>(
     mem: &mut impl Mutex<T = ObjShelf<B>>,
     name: &str,
@@ -171,7 +172,7 @@ pub fn insert<T: Storable, B: Backend>(
 /// inserts the value returned by `f` first; `f` only runs in that case, and it fails as
 /// [`insert`] does.
 ///
-/// `T` must be the type the object was inserted with.
+/// `T` must be the type the object was inserted with, as for [`get`].
 pub fn get_or_insert_with<T: Storable, B: Backend>(
     mem: &mut impl Mutex<T = ObjShelf<B>>,
     name: &str,

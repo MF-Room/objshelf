@@ -186,17 +186,21 @@ stays in RAM for the next flush.
 * **Names and types.** Each object is stored with its name, and mount reads the names from the objects:
   there is no directory to lose, and an `insert` or a `remove` writes only that object. A name is at
   most 64 bytes (`MAX_NAME_LEN`), as it is written again with each write of its object. An object must
-  be read with the type it was inserted with. A cached object of another type gives `WrongType`, but the
-  backend does not check types yet (see TODO).
-* **Limits.** An object must fit in the RAM budget (`TooBig` otherwise) and, serialized with its name,
-  in the free space of the backend: at most 65535 pages of 235 bytes (about 15 MiB) on NOR. An object that
-  doesn't fit fails its flush with `NoSpace`, and the flush goes on with the others. A read or write also
-  holds the whole serialized object on the heap while it runs. The NOR region is aligned to the erase size, has at
-  least 2 sectors (one stays free for garbage collection) and at most 16 MiB, and is used by nothing
-  else. Each write of an object gets the next number of a `u32` counter, and mount keeps the copy with
-  the highest one. The flash wears out before that counter can wrap: each write programs at least one
-  page, and a W25Q16JV takes about 768 million page writes in its life (512 sectors × 15 data pages ×
-  100 000 erases), against 4.3 billion numbers. Only a region of about 11 MiB or more could get there.
+  be read with the type it was inserted with, or `with` and `with_mut` give `WrongType`. This is checked in
+  RAM, and by the backend with a 4-byte tag stored with each object, a hash of the type's name
+  (`type_name`). Renaming a type or moving it to another module changes the tag, as can a new compiler:
+  the objects stored before then give `WrongType`. Changing the fields of a type doesn't: after a firmware
+  update, converting the stored data is up to the app.
+* **Limits.** An object must fit in the RAM budget (`TooBig` otherwise) and, serialized with its name and
+  type tag, in the free space of the backend: at most 65535 pages of 235 bytes (about 15 MiB) on NOR. An
+  object that doesn't fit fails its flush with `NoSpace`, and the flush goes on with the others. A read or
+  write also holds the whole serialized object on the heap while it runs. The NOR region is aligned to the
+  erase size, has at least 2 sectors (one stays free for garbage collection) and at most 16 MiB, and is
+  used by nothing else. Each write of an object gets the next number of a `u32` counter, and mount keeps
+  the copy with the highest one. The flash wears out before that counter can wrap: each write programs at
+  least one page, and a W25Q16JV takes about 768 million page writes in its life (512 sectors × 15 data
+  pages × 100 000 erases), against 4.3 billion numbers. Only a region of about 11 MiB or more could get
+  there.
 
 Details: the `ObjShelf` documentation in [`src/api.rs`](src/api.rs), the public API. The engine behind it is
 in [`src/memory`](src/memory/mod.rs).
@@ -206,10 +210,10 @@ in [`src/memory`](src/memory/mod.rs).
 `src/backend/nor`: object store on any blocking `embedded_storage::nor_flash::NorFlash` with 1-byte writes
 (chips with internal ECC are not supported for now). Every operation blocks until done.
 
-* Objects are serialized with postcard, their name first, and split in 256-byte pages (20-byte header, 235-byte payload,
-  1-byte obsolete marker). Page 0 of each sector holds a sector header with the format version and the
-  erase count. A sector of another format version makes mount fail with `UnsupportedFormat`, instead of
-  being erased as unformatted.
+* Objects are serialized with postcard, their name and type tag first, and split in 256-byte pages
+  (20-byte header, 235-byte payload, 1-byte obsolete marker). Page 0 of each sector holds a sector header
+  with the format version and the erase count. A sector of another format version makes mount fail with
+  `UnsupportedFormat`, instead of being erased as unformatted.
 * RAM index: `ObjectId` → current version and page list (`hashbrown::HashMap`, needs a heap).
 * Each write gets a new global version. A version counts only once all its pages are on flash, so a power
   cut leaves either the old or the new value. Replaced and removed pages are then marked obsolete.
@@ -294,8 +298,9 @@ Requirements, guarantees, time and space complexity: module documentation in
   write
 - [x] Names stored with the objects instead of in a directory object, which was a single point of
   failure (lost, mount removed every object) and was rewritten whole on every `insert` or `remove`
-- [ ] Type check on read: a stored type tag or schema hash in the backend, instead of a postcard error
-  or a wrong decode
+- [x] Type check on read: each object is stored with a 4-byte hash of its type's name, checked before
+  decoding, so a wrong type gives `WrongType` instead of a postcard error or a wrong decode. Changes to a
+  type's fields are not detected: firmware updates are up to the app
 - [x] Max name length: `MAX_NAME_LEN`, 64 bytes, `NameTooLong` from `insert`
 - [x] Max object size and flash region used by objshelf: documented (Limits)
 - [x] Host tests with a simulated `NorFlash` (power cuts, worn pages, wear-out, two geometries), `cargo test`

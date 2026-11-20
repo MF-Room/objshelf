@@ -71,7 +71,8 @@ pub enum Error<E> {
     AlreadyExists,
     /// The name is longer than [`MAX_NAME_LEN`] bytes.
     NameTooLong,
-    /// The object is cached with another type than the one of the handle.
+    /// The object was inserted with another type than the one of the handle. Checked in RAM, and
+    /// by the backend with the [`type_tag`](backend::type_tag) stored with the object.
     WrongType,
     /// The object alone takes more RAM than the whole budget, so it can never be inserted or
     /// become modified: no flush can make room for it.
