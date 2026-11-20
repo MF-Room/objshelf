@@ -7,10 +7,7 @@
 //! after a page is written (page obsolete, sector retired) are the last byte of the page, which the
 //! first write leaves erased.
 
-use crc::{CRC_32_ISO_HDLC, Crc};
-
-/// CRC-32 (IEEE 802.3), with its 1 KiB table computed at compile time.
-static CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+use crate::backend::crc32;
 
 /// Program page size: one Page Program never crosses a page boundary.
 pub(super) const PAGE_SIZE: usize = 256;
@@ -160,23 +157,9 @@ fn le32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
-/// CRC-32 of the concatenated `parts`.
-fn crc32(parts: &[&[u8]]) -> u32 {
-    let mut digest = CRC32.digest();
-    for part in parts {
-        digest.update(part);
-    }
-    digest.finalize()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn crc32_check_value() {
-        assert_eq!(crc32(&[b"1234", b"56789"]), 0xCBF4_3926);
-    }
 
     #[test]
     fn page_round_trip() {

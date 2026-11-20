@@ -20,7 +20,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
         name: clippy (host)
+      - run: cargo clippy --all-targets --features fs -- -D warnings
+        name: clippy (fs)
       - run: cargo clippy --target thumbv7em-none-eabihf -- -D warnings
         name: clippy (no_std)
       - run: cargo test
         name: test (host)
+      - run: cargo test --features fs
+        name: test (fs)

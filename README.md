@@ -15,7 +15,8 @@ You need:
 * [RTIC 2](https://rtic.rs), or any lock that implements its `Mutex` trait (re-exported as `objshelf::Mutex`);
 * a backend. The NOR backend runs on any blocking `embedded_storage::nor_flash::NorFlash` driver with
   `READ_SIZE` and `WRITE_SIZE` of 1 and an `ERASE_SIZE` that is a multiple of 256: an SPI NOR driver,
-  internal MCU flash, or a RAM simulation for tests.
+  internal MCU flash, or a RAM simulation for tests. The file system backend (feature `fs`) keeps one file
+  per object in a directory, on Linux and other Unix systems.
 
 ```toml
 [dependencies]
@@ -264,6 +265,45 @@ writes the flash could take before its first failed write.
 Requirements, guarantees, time and space complexity: module documentation in
 [`src/backend/nor/mod.rs`](src/backend/nor/mod.rs) (`cargo doc --document-private-items`).
 
+## File system backend
+
+`src/backend/fs`, with the `fs` feature: one file per object in a directory, on Linux and other Unix
+systems (it needs `std`).
+
+```toml
+objshelf = { git = "https://github.com/MF-Room/objshelf", features = ["fs"] }
+```
+
+```rust
+use objshelf::backend::fs::{FsBackend, FsConfig};
+
+let config = FsConfig { dir: "/var/lib/app/objects".into(), capacity: 64 << 20, direct_io: true };
+let mut mem = ObjShelf::<FsBackend>::mount(config, 1 << 20, || {})?;
+```
+
+* Each object is in `{id:08x}.obj`: a 16-byte header (format version, payload length, CRC32), then the
+  object serialized with postcard, its name and type tag first, padded to whole 4 KiB blocks.
+* `ObjShelf` already caches the objects in RAM, so on Linux the files are read and written with
+  `O_DIRECT`, past the page cache, which would hold a second copy. If the file system refuses it
+  (`EINVAL`), the backend falls back to buffered I/O for the rest of the mount: `direct_io()` tells which
+  is in use, and `direct_io: false` turns it off.
+* A write goes to `{id:08x}.tmp`, which is synced, renamed over the object's file, then the directory is
+  synced: after a crash, each object holds its old or its new value, and mount deletes the leftover `.tmp`
+  files. `O_DIRECT` skips the page cache, not the syncs.
+* `capacity` is a quota on the files, headers and padding included: a write past it fails with `NoSpace`,
+  and the object keeps its previous value. `usage` counts whole blocks, with nothing to reclaim.
+* Mount lists the directory and reads the first block of each file, which holds the name. A file whose
+  header or name is damaged is skipped and left on disk, so it never blocks the mount; a file of another
+  format version makes mount fail with `UnsupportedFormat`. `read` checks the CRC: `Corrupt` if it
+  doesn't match.
+* A lock file makes a second mount of the directory, from any process, fail with `Locked`. Other files in
+  the directory are ignored.
+* Limits: at least 4 KiB on disk per object, and less than 4 GiB serialized. A read or write holds the
+  whole file in RAM, plus 4 KiB to align it.
+
+Requirements, guarantees, time and space complexity: module documentation in
+[`src/backend/fs/mod.rs`](src/backend/fs/mod.rs) (`cargo doc --features fs --document-private-items`).
+
 ## TODO
 
 - [x] Reuse a store crate (`sequential-storage`, `ekv`, `littlefs2`) or write one: own store
@@ -305,3 +345,5 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [x] Max object size and flash region used by objshelf: documented (Limits)
 - [x] Host tests with a simulated `NorFlash` (power cuts, worn pages, wear-out, two geometries), `cargo test`
   in CI
+- [x] File system backend (feature `fs`): one file per object, replaced by a rename, `O_DIRECT` with a
+  buffered fallback, a quota, a lock against a second mount

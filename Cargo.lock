@@ -121,6 +121,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71dd52191aae121e8611f1e8dc3e324dd0dd1dee1e6dd91d10ee07a3cfb4d9d8"
 
 [[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
 name = "manyhow"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -151,6 +157,7 @@ dependencies = [
  "embedded-storage",
  "get-size2",
  "hashbrown",
+ "libc",
  "postcard",
  "rtic-core",
  "serde",

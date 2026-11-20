@@ -1,10 +1,13 @@
 //! Storage backends: where objects live when they are not in RAM.
 
+#[cfg(all(feature = "fs", unix))]
+pub mod fs;
 pub mod nor;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crc::{CRC_32_ISO_HDLC, Crc};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::ObjectId;
@@ -77,6 +80,28 @@ pub fn type_tag<T: ?Sized>() -> u32 {
     })
 }
 
+/// Decodes an object serialized as `(name, type_tag::<T>(), value)`: `None` if its tag is not
+/// `T`'s, checked before the value is decoded.
+fn decode<T: DeserializeOwned>(data: &[u8]) -> postcard::Result<Option<T>> {
+    let ((_name, tag), value): ((&str, [u8; 4]), _) = postcard::take_from_bytes(data)?;
+    if u32::from_le_bytes(tag) != type_tag::<T>() {
+        return Ok(None);
+    }
+    postcard::from_bytes(value).map(Some)
+}
+
+/// CRC-32 (IEEE 802.3), with its 1 KiB table computed at compile time.
+static CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+
+/// CRC-32 of the concatenated `parts`.
+fn crc32(parts: &[&[u8]]) -> u32 {
+    let mut digest = CRC32.digest();
+    for part in parts {
+        digest.update(part);
+    }
+    digest.finalize()
+}
+
 /// Space of a backend, in bytes of serialized objects.
 ///
 /// A backend can store data in fixed-size units (pages on NOR flash), so a small object takes a
@@ -129,5 +154,15 @@ impl Wear {
     /// Erases left before every sector reaches `endurance`, the erases a sector is rated for.
     pub fn remaining_erases(&self, endurance: u32) -> u64 {
         (u64::from(self.sectors) * u64::from(endurance)).saturating_sub(self.total_erases)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc32_check_value() {
+        assert_eq!(crc32(&[b"1234", b"56789"]), 0xCBF4_3926);
     }
 }

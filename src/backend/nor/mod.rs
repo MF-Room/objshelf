@@ -114,7 +114,7 @@ use embedded_storage::nor_flash::NorFlash;
 use hashbrown::HashMap;
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::{Backend, Usage, Wear, type_tag};
+use super::{Backend, Usage, Wear, decode, type_tag};
 use crate::ObjectId;
 use layout::{MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE};
 
@@ -308,14 +308,7 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
 
     fn read<T: DeserializeOwned>(&mut self, id: ObjectId) -> Result<Option<T>, Self::Error> {
         let data = self.read_data(id)?;
-        let ((_name, tag), value): ((&str, [u8; 4]), _) =
-            postcard::take_from_bytes(&data).map_err(NorError::Serialization)?;
-        if u32::from_le_bytes(tag) != type_tag::<T>() {
-            return Ok(None);
-        }
-        postcard::from_bytes(value)
-            .map(Some)
-            .map_err(NorError::Serialization)
+        decode(&data).map_err(NorError::Serialization)
     }
 
     /// Reads the pages of the object until its name is whole: the first one only, unless the name
