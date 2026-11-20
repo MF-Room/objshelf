@@ -195,8 +195,8 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
         }
         let range = self.check(from, (to - from) as usize)?;
         let cut = self.next_op()?;
-        for sector in range.start / ERASE_SIZE..range.end / ERASE_SIZE {
-            self.erases[sector] += 1;
+        for erases in &mut self.erases[range.start / ERASE_SIZE..range.end / ERASE_SIZE] {
+            *erases += 1;
         }
         self.data[part(range, cut)].fill(0xFF);
         self.end(cut)
