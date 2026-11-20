@@ -41,7 +41,7 @@ impl<F: NorFlash> NorBackend<F> {
     }
 
     /// Writes `data`, the object `id` serialized with its name, as its new version, then releases
-    /// the old one.
+    /// the old one. On an error, the object keeps its old version.
     pub(super) fn write_data(
         &mut self,
         id: ObjectId,
@@ -49,6 +49,7 @@ impl<F: NorFlash> NorBackend<F> {
     ) -> Result<(), NorError<F::Error>> {
         let count = data.len().div_ceil(PAYLOAD_SIZE).max(1);
         let header_count = u16::try_from(count).map_err(|_| NorError::NoSpace)?;
+        self.mark_unmarked()?;
         self.ensure_space(count)?;
 
         let version = self.next_version;
@@ -64,8 +65,15 @@ impl<F: NorFlash> NorBackend<F> {
                 count: header_count,
                 len: chunk.len() as u16,
             };
-            let page = self.write_page(&header.encode(chunk))?;
-            pages.push(page as u16);
+            match self.write_page(&header.encode(chunk)) {
+                Ok(page) => pages.push(page as u16),
+                Err(error) => {
+                    // An incomplete version: the page that failed may be whole anyway, which
+                    // completes it if it was the last one.
+                    self.unmarked.extend(pages);
+                    return Err(error);
+                }
+            }
         }
 
         // Every page is on flash: the new version is complete, the old one can go.
@@ -73,18 +81,21 @@ impl<F: NorFlash> NorBackend<F> {
             self.sectors[Self::sector_of(usize::from(page))].live += 1;
         }
         if let Some(old) = self.objects.insert(id, Object { version, pages }) {
-            self.release(&old.pages)?;
+            self.release(&old.pages);
         }
         Ok(())
     }
 
-    /// Marks the pages of a replaced or removed version obsolete.
-    pub(super) fn release(&mut self, pages: &[u16]) -> Result<(), NorError<F::Error>> {
+    /// Releases the pages of a replaced or removed version: they stop counting as live, and are
+    /// marked obsolete. This does not fail: the version is already dead, as a newer one holds the
+    /// object or one of its pages is obsolete. Pages the flash fails to mark stay in `unmarked`,
+    /// marked before the next write or removal.
+    pub(super) fn release(&mut self, pages: &[u16]) {
         for &page in pages {
-            let page = usize::from(page);
-            self.sectors[Self::sector_of(page)].live -= 1;
-            self.mark_obsolete(page)?;
+            self.sectors[Self::sector_of(usize::from(page))].live -= 1;
         }
-        Ok(())
+        self.unmarked.extend_from_slice(pages);
+        // On a flash error, the pages left stay in `unmarked`.
+        let _ = self.mark_unmarked();
     }
 }

@@ -37,6 +37,11 @@ impl<F: NorFlash> NorBackend<F> {
     /// Erases a sector and writes its header, then reads the header back. Returns `false` if it
     /// reads back wrong: the sector stays free and unformatted, to be erased again before use.
     pub(super) fn erase_sector(&mut self, sector: usize) -> Result<bool, NorError<F::Error>> {
+        // Once erased, the pages are reused: a page marked then would be another one.
+        debug_assert!(
+            self.unmarked.is_empty(),
+            "a write marks them before collecting garbage"
+        );
         let addr = self.sector_addr(sector);
         let erase_count = self.sectors[sector].erase_count.saturating_add(1);
         self.sectors[sector] = Sector {
@@ -86,10 +91,13 @@ impl<F: NorFlash> NorBackend<F> {
         for _ in 0..WRITE_ATTEMPTS {
             let page = self.alloc_page()?;
             let addr = self.page_addr(page);
+            // Until it reads back right: a flash error can leave it whole, it is marked later.
+            self.unmarked.push(page as u16);
             if self.program_checked(addr, bytes)? {
+                self.unmarked.pop();
                 return Ok(page);
             }
-            self.mark_obsolete(page)?;
+            self.mark_unmarked()?;
         }
         Err(NorError::VerifyFailed)
     }

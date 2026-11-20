@@ -1,11 +1,12 @@
 //! Garbage collection: reclaims a sector by moving its live pages, then erasing it. It also
 //! levels the wear of sectors whose data never changes (static wear leveling).
 
+use alloc::vec::Vec;
 use core::cmp::Reverse;
 
 use embedded_storage::nor_flash::NorFlash;
 
-use super::layout::{MARKER_OFFSET, PageHeader, is_obsolete};
+use super::layout::{MARKER_OFFSET, PageHeader};
 use super::{NorBackend, NorError, WEAR_GAP};
 use crate::ObjectId;
 
@@ -89,6 +90,24 @@ impl<F: NorFlash> NorBackend<F> {
 
     /// Moves the live pages of `sector` to the active sector, then erases it.
     fn reclaim(&mut self, sector: usize) -> Result<(), NorError<F::Error>> {
+        let mut moved = Vec::new();
+        let result = self.relocate(sector, &mut moved).and_then(|()| {
+            // Retire the sector before erasing it, so a cut erase is detected at mount.
+            self.program_marker(self.sector_addr(sector) + MARKER_OFFSET as u32)
+        });
+        if let Err(error) = result {
+            // Not retired, the sector still counts at mount: the first copies of the moved pages
+            // would bring their version back once the new copies are marked, by a removal.
+            self.unmarked.extend(moved);
+            return Err(error);
+        }
+        // Reclaimed even if its header reads back wrong: it is then erased again before use.
+        self.erase_sector(sector)?;
+        Ok(())
+    }
+
+    /// Moves the live pages of `sector` to the active sector, adding the pages moved to `moved`.
+    fn relocate(&mut self, sector: usize, moved: &mut Vec<u16>) -> Result<(), NorError<F::Error>> {
         for index in 1..self.sectors[sector].next_page {
             let page = sector * Self::PAGES_PER_SECTOR + index;
             let bytes = self.read_page(page)?;
@@ -97,11 +116,11 @@ impl<F: NorFlash> NorBackend<F> {
             };
             let id = ObjectId(header.object_id);
             let slot = usize::from(header.index);
-            let live = !is_obsolete(&bytes)
-                && self.objects.get(&id).is_some_and(|object| {
-                    object.version == header.version
-                        && object.pages.get(slot) == Some(&(page as u16))
-                });
+            // RAM decides, not the marker: a removal whose mark was written although the flash
+            // reported an error still has its object, until it is retried.
+            let live = self.objects.get(&id).is_some_and(|object| {
+                object.version == header.version && object.pages.get(slot) == Some(&(page as u16))
+            });
             if !live {
                 continue;
             }
@@ -114,13 +133,8 @@ impl<F: NorFlash> NorBackend<F> {
             }
             self.sectors[Self::sector_of(new)].live += 1;
             self.sectors[sector].live -= 1;
+            moved.push(page as u16);
         }
-
-        // Retire the sector before erasing it, so a cut erase is detected at mount.
-        let addr = self.sector_addr(sector) + MARKER_OFFSET as u32;
-        self.program(addr, &[0])?;
-        // Reclaimed even if its header reads back wrong: it is then erased again before use.
-        self.erase_sector(sector)?;
         Ok(())
     }
 }

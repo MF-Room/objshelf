@@ -1,4 +1,4 @@
-//! RAM flash for the tests, with power-cut injection.
+//! RAM flash for the tests, with power-cut and error injection.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -19,6 +19,9 @@ pub(crate) enum MockError {
     NotAligned,
     /// The power was cut: the operation is partly done and the flash accepts nothing more.
     PowerCut,
+    /// The operation failed, maybe partly done, and the flash keeps working: a bus error or a
+    /// timeout.
+    Failed,
 }
 
 impl NorFlashError for MockError {
@@ -26,7 +29,7 @@ impl NorFlashError for MockError {
         match self {
             MockError::OutOfBounds => NorFlashErrorKind::OutOfBounds,
             MockError::NotAligned => NorFlashErrorKind::NotAligned,
-            MockError::PowerCut => NorFlashErrorKind::Other,
+            MockError::PowerCut | MockError::Failed => NorFlashErrorKind::Other,
         }
     }
 }
@@ -38,6 +41,14 @@ pub(crate) enum Cut {
     SecondHalf,
 }
 
+/// How much of an operation is done.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Done {
+    Nothing,
+    Half(Cut),
+    All,
+}
+
 /// Flash with 1-byte writes and `ERASE_SIZE` sectors. Like the W25Q16JV, it only programs erased
 /// bytes and a write never crosses a 256-byte page: both panic, as they are backend bugs.
 pub(crate) struct MockFlash<const ERASE_SIZE: usize> {
@@ -47,6 +58,8 @@ pub(crate) struct MockFlash<const ERASE_SIZE: usize> {
     /// Offset of the write the power was cut in, if a write was cut.
     pub(super) cut_write: Option<u32>,
     cut: Option<(usize, Cut)>,
+    /// Operations that fail without a power cut, and how much of each is done.
+    fail: Vec<(usize, Done)>,
     dead: bool,
     /// Runs at the start of each program operation, as an interrupt during a write.
     pub(crate) on_write: Option<Box<dyn FnMut() + Send>>,
@@ -74,6 +87,7 @@ impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
             ops: 0,
             cut_write: None,
             cut: None,
+            fail: Vec::new(),
             dead: false,
             on_write: None,
             worn: Vec::new(),
@@ -103,6 +117,13 @@ impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
         self
     }
 
+    /// Fails program or erase operation number `op` (0-based) with [`MockError::Failed`], once
+    /// `done` of it is done. The flash keeps working.
+    pub(crate) fn fail_at(mut self, op: usize, done: Done) -> Self {
+        self.fail.push((op, done));
+        self
+    }
+
     /// Copies the data to `left` when the power is cut, as the flash is lost with a mount that
     /// fails.
     pub(crate) fn copy_on_cut(mut self, left: Arc<Mutex<Vec<u8>>>) -> Self {
@@ -115,31 +136,35 @@ impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
         self.dead = true;
     }
 
-    /// Counts a program or erase operation and returns how it is cut, if it is.
-    fn next_op(&mut self) -> Result<Option<Cut>, MockError> {
+    /// Counts a program or erase operation. Returns how much of it to do, and the error it then
+    /// returns, if any.
+    fn next_op(&mut self) -> Result<(Done, Option<MockError>), MockError> {
         if self.dead {
             return Err(MockError::PowerCut);
         }
         let op = self.ops;
         self.ops += 1;
-        match self.cut {
-            Some((at, cut)) if at == op => {
-                self.dead = true;
-                Ok(Some(cut))
-            }
-            _ => Ok(None),
+        if let Some((at, cut)) = self.cut
+            && at == op
+        {
+            self.dead = true;
+            return Ok((Done::Half(cut), Some(MockError::PowerCut)));
+        }
+        match self.fail.iter().find(|(at, _)| *at == op) {
+            Some(&(_, done)) => Ok((done, Some(MockError::Failed))),
+            None => Ok((Done::All, None)),
         }
     }
 
-    /// Ends an operation: `PowerCut` if it was cut, after copying the data to `left`.
-    fn end(&self, cut: Option<Cut>) -> Result<(), MockError> {
-        if cut.is_none() {
+    /// Ends an operation with `error`, if any, after copying the data to `left` on a power cut.
+    fn end(&self, error: Option<MockError>) -> Result<(), MockError> {
+        let Some(error) = error else {
             return Ok(());
-        }
-        if let Some(left) = &self.left {
+        };
+        if let (MockError::PowerCut, Some(left)) = (error, &self.left) {
             left.lock().unwrap().clone_from(&self.data);
         }
-        Err(MockError::PowerCut)
+        Err(error)
     }
 
     fn check(&self, offset: u32, len: usize) -> Result<Range<usize>, MockError> {
@@ -152,12 +177,13 @@ impl<const ERASE_SIZE: usize> MockFlash<ERASE_SIZE> {
     }
 }
 
-fn part(range: Range<usize>, cut: Option<Cut>) -> Range<usize> {
+fn part(range: Range<usize>, done: Done) -> Range<usize> {
     let mid = range.start + range.len() / 2;
-    match cut {
-        None => range,
-        Some(Cut::FirstHalf) => range.start..mid,
-        Some(Cut::SecondHalf) => mid..range.end,
+    match done {
+        Done::Nothing => range.start..range.start,
+        Done::Half(Cut::FirstHalf) => range.start..mid,
+        Done::Half(Cut::SecondHalf) => mid..range.end,
+        Done::All => range,
     }
 }
 
@@ -194,12 +220,12 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
             return Err(MockError::NotAligned);
         }
         let range = self.check(from, (to - from) as usize)?;
-        let cut = self.next_op()?;
+        let (done, error) = self.next_op()?;
         for erases in &mut self.erases[range.start / ERASE_SIZE..range.end / ERASE_SIZE] {
             *erases += 1;
         }
-        self.data[part(range, cut)].fill(0xFF);
-        self.end(cut)
+        self.data[part(range, done)].fill(0xFF);
+        self.end(error)
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
@@ -217,19 +243,19 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
         if let Some(at) = range.clone().find(|&at| self.data[at] != 0xFF) {
             panic!("programming a byte that is not erased at {at:#x}");
         }
-        let cut = self.next_op()?;
-        if cut.is_some() {
+        let (done, error) = self.next_op()?;
+        if error == Some(MockError::PowerCut) {
             self.cut_write = Some(offset);
         }
         if self.worn_out(range.start / ERASE_SIZE) {
-            return self.end(cut);
+            return self.end(error);
         }
-        for at in part(range.clone(), cut) {
+        for at in part(range.clone(), done) {
             if at % PAGE_SIZE == 0 && self.worn.contains(&(at / PAGE_SIZE)) {
                 continue;
             }
             self.data[at] &= bytes[at - range.start];
         }
-        self.end(cut)
+        self.end(error)
     }
 }

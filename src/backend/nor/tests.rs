@@ -6,7 +6,7 @@ use crc::{CRC_32_ISO_HDLC, Crc};
 use serde::{Deserialize, Serialize};
 
 use super::layout::{FORMAT_VERSION, PAGE_SIZE, PageHeader};
-use super::mock::{Cut, MockError, MockFlash};
+use super::mock::{Cut, Done, MockError, MockFlash};
 use super::{NorBackend, NorConfig, NorError, WEAR_GAP};
 use crate::ObjectId;
 use crate::backend::{Backend, Usage, Wear, type_tag};
@@ -251,9 +251,25 @@ fn another_format_version_fails_the_mount() {
     assert!(matches!(mounted, Err(NorError::UnsupportedFormat(v)) if v == next));
 }
 
+#[derive(Debug, Clone)]
 enum Op {
     Write(u32, Vec<u8>),
     Remove(u32),
+}
+
+impl Op {
+    fn id(&self) -> u32 {
+        match self {
+            Op::Write(id, _) | Op::Remove(id) => *id,
+        }
+    }
+
+    fn apply_to(&self, backend: &mut NorBackend<SmallFlash>) -> Result<(), NorError<MockError>> {
+        match self {
+            Op::Write(id, value) => backend.write(ObjectId(*id), "", value),
+            Op::Remove(id) => backend.remove(ObjectId(*id)),
+        }
+    }
 }
 
 /// Updates and removals on a small flash, so that the sequence includes garbage collections.
@@ -284,11 +300,7 @@ fn apply(state: &mut BTreeMap<u32, Vec<u8>>, op: &Op) {
 fn run(flash: SmallFlash, ops: &[Op]) -> (SmallFlash, Option<usize>) {
     let mut backend = mount(flash);
     for (index, op) in ops.iter().enumerate() {
-        let result = match op {
-            Op::Write(id, value) => backend.write(ObjectId(*id), "", value),
-            Op::Remove(id) => backend.remove(ObjectId(*id)),
-        };
-        if let Err(error) = result {
+        if let Err(error) = op.apply_to(&mut backend) {
             assert!(
                 matches!(error, NorError::Flash(MockError::PowerCut)),
                 "{error:?}"
@@ -322,11 +334,15 @@ fn power_cut_at_every_operation() {
     for cut in [Cut::FirstHalf, Cut::SecondHalf] {
         for at in 0..total {
             let (flash, failed) = run(SmallFlash::new(3).cut_at(at, cut), &ops);
-            let failed = failed.expect("the cut fails an operation");
+            // None if the cut hit the marks of the old version in the last op: the new version
+            // is whole, so the op succeeds.
+            let failed = failed.unwrap_or(ops.len());
             let mut before = BTreeMap::new();
             ops[..failed].iter().for_each(|op| apply(&mut before, op));
             let mut after = before.clone();
-            apply(&mut after, &ops[failed]);
+            if let Some(op) = ops.get(failed) {
+                apply(&mut after, op);
+            }
 
             let mut backend = mount(MockFlash::with_data(flash.data));
             let found = stored(&mut backend);
@@ -340,6 +356,240 @@ fn power_cut_at_every_operation() {
             let mut backend = reboot(backend);
             assert_eq!(stored(&mut backend), found);
             assert_eq!(read(&mut backend, 3), Some(bytes(9, 50)));
+        }
+    }
+}
+
+type State = BTreeMap<u32, Vec<u8>>;
+
+/// Every object the backend holds, with its value.
+fn contents(backend: &mut NorBackend<SmallFlash>) -> State {
+    let ids = backend.ids();
+    ids.into_iter()
+        .map(|id| (id.0, read(backend, id.0).expect("listed")))
+        .collect()
+}
+
+/// What a reboot now finds: the objects of a mount of a copy of the flash, and that mount.
+fn reboot_copy(backend: &NorBackend<SmallFlash>) -> (State, NorBackend<SmallFlash>) {
+    let mut rebooted = mount(SmallFlash::with_data(backend.flash.data.clone()));
+    (contents(&mut rebooted), rebooted)
+}
+
+/// `state`, then each of `ops` done or not.
+fn either(state: &State, ops: &[&Op]) -> Vec<State> {
+    let mut states = vec![state.clone()];
+    for op in ops {
+        let done: Vec<State> = (states.iter())
+            .map(|state| {
+                let mut state = state.clone();
+                apply(&mut state, op);
+                state
+            })
+            .collect();
+        states.extend(done);
+    }
+    states
+}
+
+/// Runs `ops` on a flash whose operations `fail` fail without a power cut, and checks the backend
+/// after each op. As `ObjShelf` does, an op that fails is retried after the next op, or before it
+/// if both are on the same object. Returns the errors.
+fn run_with_errors(ops: &[Op], fail: &[(usize, Done)]) -> usize {
+    let flash = (fail.iter()).fold(SmallFlash::new(4), |flash, &(at, done)| {
+        flash.fail_at(at, done)
+    });
+    let mut backend = mount(flash);
+    let mut expected = State::new();
+    let mut errors = 0;
+    // The op that failed, to retry after the next one.
+    let mut failed: Option<&Op> = None;
+    for (index, op) in ops.iter().enumerate() {
+        let at = format!("{fail:?}, op {index}");
+        let pending = failed.take();
+        if let Some(pending) = pending.filter(|pending| pending.id() == op.id()) {
+            errors += until_done(&mut backend, pending, &[], &mut expected, &at);
+        }
+        let pending = pending.filter(|pending| pending.id() != op.id());
+        match op.apply_to(&mut backend) {
+            Ok(()) => apply(&mut expected, op),
+            Err(error) => {
+                errors += 1;
+                let undone: Vec<&Op> = [op].into_iter().chain(pending).collect();
+                check_error(&mut backend, error, &expected, &undone, &at);
+                if pending.is_none() {
+                    failed = Some(op);
+                    continue;
+                }
+                errors += until_done(&mut backend, op, &[pending.unwrap()], &mut expected, &at);
+            }
+        }
+        if let Some(pending) = pending {
+            // Meanwhile, the flash holds the object of the failed op as before or after it.
+            let (found, _) = reboot_copy(&backend);
+            let states = either(&expected, &[pending]);
+            assert!(
+                states.contains(&found),
+                "{at}: reboot, {pending:?} pending: {found:?}"
+            );
+            errors += until_done(&mut backend, pending, &[], &mut expected, &at);
+        }
+        if errors > 0 {
+            check(&mut backend, &expected, &at);
+        }
+    }
+    if let Some(failed) = failed {
+        errors += until_done(&mut backend, failed, &[], &mut expected, "last op");
+        check(&mut backend, &expected, "last op");
+    }
+    errors
+}
+
+/// Runs `op` until it succeeds, then applies it to `expected`; `pending` failed and is not retried
+/// yet. Returns the errors.
+fn until_done(
+    backend: &mut NorBackend<SmallFlash>,
+    op: &Op,
+    pending: &[&Op],
+    expected: &mut State,
+    at: &str,
+) -> usize {
+    let mut errors = 0;
+    while let Err(error) = op.apply_to(backend) {
+        errors += 1;
+        assert!(errors < 10, "{at}: {op:?} keeps failing");
+        let undone: Vec<&Op> = [op].into_iter().chain(pending.iter().copied()).collect();
+        check_error(backend, error, expected, &undone, at);
+    }
+    apply(expected, op);
+    errors
+}
+
+/// After an op that failed: the backend still holds `expected`, the state before the ops
+/// `undone`, and a reboot finds each of them done or not.
+fn check_error(
+    backend: &mut NorBackend<SmallFlash>,
+    error: NorError<MockError>,
+    expected: &State,
+    undone: &[&Op],
+    at: &str,
+) {
+    assert!(
+        matches!(error, NorError::Flash(MockError::Failed)),
+        "{at}: {error:?}"
+    );
+    assert_eq!(&contents(backend), expected, "{at}: after the error");
+    let (found, _) = reboot_copy(backend);
+    assert!(
+        either(expected, undone).contains(&found),
+        "{at}: reboot, {undone:?} undone: {found:?}"
+    );
+}
+
+/// With no failed op left: the backend holds `expected`, every page left to clean up is in
+/// `unmarked`, and a reboot finds `expected` and the same used space.
+fn check(backend: &mut NorBackend<SmallFlash>, expected: &State, at: &str) {
+    assert_eq!(&contents(backend), expected, "{at}");
+    let (found, rebooted) = reboot_copy(backend);
+    assert_eq!(&found, expected, "{at}: reboot");
+    assert_eq!(rebooted.usage().used, backend.usage().used, "{at}: used");
+    if backend.unmarked.is_empty() {
+        assert_eq!(rebooted.flash.ops, 0, "{at}: the mount cleaned up");
+    }
+}
+
+/// Writes, updates and removals of 3 objects on a small flash, with garbage collections that move
+/// pages, and removals right after writes.
+fn mixed_ops() -> Vec<Op> {
+    let mut ops = vec![Op::Write(3, bytes(3, 300))];
+    for round in 0..12u8 {
+        ops.push(Op::Write(1, bytes(round, 20)));
+        ops.push(Op::Write(2, bytes(round, 300)));
+        if round % 3 == 2 {
+            ops.push(Op::Remove(2));
+        }
+        if round % 4 == 3 {
+            ops.push(Op::Remove(3));
+            ops.push(Op::Write(3, bytes(round, 300)));
+        }
+    }
+    ops
+}
+
+const DONE: [Done; 4] = [
+    Done::Nothing,
+    Done::Half(Cut::FirstHalf),
+    Done::Half(Cut::SecondHalf),
+    Done::All,
+];
+
+#[test]
+fn a_flash_error_at_every_operation_changes_nothing_and_is_retried() {
+    let ops = mixed_ops();
+    let total = run(SmallFlash::new(4), &ops).0.ops;
+    let mut errors = 0;
+    for done in DONE {
+        for at in 0..total {
+            // None when a mark of a released version fails: it is marked later.
+            let run_errors = run_with_errors(&ops, &[(at, done)]);
+            assert!(run_errors <= 1);
+            errors += run_errors;
+        }
+    }
+    // Most runs see the error.
+    assert!(errors > 3 * total);
+}
+
+#[test]
+fn a_flash_error_around_a_garbage_collection_and_a_removal() {
+    // Object 1 is left alone in sector 0 with 2 pages of garbage, so the garbage collection of
+    // the 6th op picks that sector and moves it.
+    let setup = [
+        Op::Write(1, bytes(1, 20)),
+        Op::Write(2, bytes(2, 300)),
+        Op::Write(2, bytes(3, 300)),
+        Op::Write(3, bytes(4, 300)),
+        Op::Write(3, bytes(5, 300)),
+    ];
+    let collect = Op::Write(2, bytes(6, 300));
+    let remove = Op::Remove(1);
+    // A failed collection, then the removal of the object it moved; a failed removal, then the
+    // collection of its sector.
+    let (flash, _) = run(SmallFlash::new(4), &setup);
+    let setup_ops = flash.ops;
+    let mut moved = mount(SmallFlash::with_data(flash.data));
+    collect.apply_to(&mut moved).unwrap();
+    assert_ne!(moved.objects[&ObjectId(1)].pages, [1], "object 1 is moved");
+
+    for last in [[&collect, &remove], [&remove, &collect]] {
+        let ops: Vec<Op> = setup.iter().chain(last).cloned().collect();
+        let total = run(SmallFlash::new(4), &ops).0.ops;
+        for done in DONE {
+            for at in setup_ops..total {
+                run_with_errors(&ops, &[(at, done)]);
+            }
+        }
+    }
+}
+
+#[test]
+fn two_flash_errors_at_every_pair_of_operations() {
+    // An update then a removal of the same object, between writes of others.
+    let ops = [
+        Op::Write(3, bytes(3, 300)),
+        Op::Write(2, bytes(1, 300)),
+        Op::Write(2, bytes(2, 300)),
+        Op::Remove(2),
+        Op::Write(1, bytes(1, 20)),
+        Op::Remove(3),
+    ];
+    let total = run(SmallFlash::new(4), &ops).0.ops;
+    for first in 0..total {
+        // The error shifts the later operations by one at most.
+        for second in first + 1..=total {
+            for (a, b) in DONE.into_iter().flat_map(|a| DONE.map(|b| (a, b))) {
+                run_with_errors(&ops, &[(first, a), (second, b)]);
+            }
         }
     }
 }
@@ -567,11 +817,14 @@ fn power_cut_while_static_data_moves() {
         for at in 0..total {
             let flash = SmallFlash::with_data(data.clone()).cut_at(at, cut);
             let (flash, failed) = run(flash, &ops);
-            let failed = failed.expect("the cut fails an operation");
+            // None if the cut hit the marks of the old version in the last op.
+            let failed = failed.unwrap_or(ops.len());
             let mut before = initial.clone();
             ops[..failed].iter().for_each(|op| apply(&mut before, op));
             let mut after = before.clone();
-            apply(&mut after, &ops[failed]);
+            if let Some(op) = ops.get(failed) {
+                apply(&mut after, op);
+            }
 
             let mut backend = mount(SmallFlash::with_data(flash.data));
             let found = stored(&mut backend);

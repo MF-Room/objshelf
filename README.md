@@ -220,7 +220,13 @@ in [`src/memory`](src/memory/mod.rs).
   cut leaves either the old or the new value. Replaced and removed pages are then marked obsolete.
 * A page whose write was cut can read right and lose weak bits later. When the cut hit an update or a
   garbage collection, the old copy is still there at mount, which then writes the object again.
-* Every byte is programmed once between erases, and only from `0xFF`.
+* Every byte is programmed once between erases, and only from `0xFF`: a mark retried after a flash error
+  reads its byte first.
+* A flash error that is not a power cut fails the operation without changing what the backend reports: a
+  write keeps the old value, a removal keeps the object, and a retry finishes it. The RAM index never gets
+  ahead of the flash: a removal marks a page of the object obsolete before it forgets the object, and pages
+  whose obsolete mark fails are kept in a list and marked before the next write or removal. After a reboot,
+  the failed operation may be done or not, as after a power cut.
 * Garbage collection relocates the live pages of the sector with the most garbage and erases it; one free
   sector is kept for it. Ties go to the least worn sector.
 * Wear: new pages go to the least worn free sector. Data that never changes would keep its sector out
@@ -318,8 +324,9 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [x] Read back each page and sector header after its write, and write it again elsewhere if it reads
   back wrong (`VerifyFailed` after 3 tries)
 - [x] Format version in the sector header: mount fails on another version instead of erasing it
+- [x] Flash errors: the RAM index never gets ahead of the flash, so a failed operation changes nothing
+  the backend reports and a retry finishes it; no remount
 - [ ] Edge cases:
-  - after a flash error, the RAM state may not match the flash: define the rule (remount?)
   - a page that decays after its write only shows up as `Corrupt` on read, with no fallback: bit rot,
     or weak bits after a cut at the very end of an object's first write (an update or a garbage
     collection cut that way is written again at mount)
@@ -343,7 +350,7 @@ Requirements, guarantees, time and space complexity: module documentation in
   type's fields are not detected: firmware updates are up to the app
 - [x] Max name length: `MAX_NAME_LEN`, 64 bytes, `NameTooLong` from `insert`
 - [x] Max object size and flash region used by objshelf: documented (Limits)
-- [x] Host tests with a simulated `NorFlash` (power cuts, worn pages, wear-out, two geometries), `cargo test`
-  in CI
+- [x] Host tests with a simulated `NorFlash` (power cuts, flash errors, worn pages, wear-out, two
+  geometries), `cargo test` in CI
 - [x] File system backend (feature `fs`): one file per object, replaced by a rename, `O_DIRECT` with a
   buffered fallback, a quota, a lock against a second mount

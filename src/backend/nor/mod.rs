@@ -38,6 +38,13 @@
 //! - A `write` or `remove` is on flash when it returns: nothing is buffered.
 //! - Each object is updated atomically. There are no transactions over several objects.
 //! - After a power cut at any point, mount restores a consistent state.
+//! - A flash error that is not a power cut (the driver returns an error) fails the operation
+//!   without changing what the backend reports, and a retry finishes it: a failed `write` keeps the
+//!   object's old value, a failed `remove` keeps the object. After a reboot, the failed operation
+//!   may be done or not, as after a power cut. The RAM index never gets ahead of the flash: a
+//!   `remove` marks a page of the object obsolete before it forgets the object, and a page whose
+//!   obsolete mark fails is kept in a list, marked before the next `write` or `remove`. Such a
+//!   mark, for a version already replaced, doesn't fail the `write`.
 //! - A page write cut by a power loss can leave weak bits: the page reads right, then turns
 //!   `Corrupt` later. When the cut hit an update or a garbage collection, mount sees it and writes
 //!   the object again. When it hit the very end of an object's first write, nothing tells.
@@ -57,15 +64,16 @@
 //!
 //! | Operation | Flash | CPU |
 //! |---|---|---|
-//! | `mount` | reads all `N` pages; after a crash, one 1-byte write per stale page and a `write` of each object that had some | `O(N + S)` |
+//! | `mount` | reads all `N` pages; after a crash, one 1-byte read and write per stale page and a `write` of each object that had some | `O(N + S)` |
 //! | `read` | `k` page reads | `O(len)` |
-//! | `write`, no GC | `k` blank-check reads, `k` page writes, `k` read-backs, `k'` 1-byte writes | `O(len + S)` |
-//! | `remove` | `k'` 1-byte writes | `O(k')` |
+//! | `write`, no GC | `k` blank-check reads, `k` page writes, `k` read-backs, `k'` 1-byte reads and writes | `O(len + S)` |
+//! | `remove` | `k'` 1-byte reads and writes | `O(k')` |
 //! | `usage` | none | `O(S)` |
-//! | GC, per sector reclaimed | up to `3 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 2 small writes, 1 small read | `O(S + P)` |
+//! | GC, per sector reclaimed | up to `3 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 2 small writes, 2 small reads | `O(S + P)` |
 //!
 //! A page that reads back wrong costs one more page: a blank check, a write, a read-back and a
-//! 1-byte write. Hash map operations are expected `O(1)`.
+//! 1-byte read and write. A mark reads its byte first, as one retried after a flash error may be
+//! done already. Hash map operations are expected `O(1)`.
 //!
 //! Garbage collection only runs inside a `write` that lacks space, possibly for several sectors.
 //! When the wear gets uneven, it also moves one sector of data that never changes: the cost of
@@ -85,6 +93,7 @@
 //! - index: about 24 B per object plus 2 B per page. Each page belongs to at most one object, so
 //!   page lists total at most `2 × N` bytes (16 KiB for 2 MiB);
 //! - sector table: 16 B per sector (8 KiB for 2 MiB with 4 KiB sectors);
+//! - pages left to mark after a flash error: 2 B each, none otherwise;
 //! - `read` and `write`: the whole serialized object, plus a 256 B page buffer on the stack;
 //! - `mount`, temporarily: 4 B per page found, 8 B per sector.
 //!
@@ -188,6 +197,11 @@ pub struct NorBackend<F: NorFlash> {
     /// Sector new pages are allocated from.
     active: Option<usize>,
     next_version: u32,
+    /// Pages that hold no live data but may still hold a whole page of it, not marked obsolete
+    /// as the flash failed: a version replaced or removed, a write or a relocation cut by the
+    /// error. Marked before the next write or removal, so that no old version comes back at
+    /// mount.
+    unmarked: Vec<u16>,
 }
 
 impl<F: NorFlash> NorBackend<F> {
@@ -246,8 +260,30 @@ impl<F: NorFlash> NorBackend<F> {
     }
 
     fn mark_obsolete(&mut self, page: usize) -> Result<(), NorError<F::Error>> {
-        let addr = self.page_addr(page) + MARKER_OFFSET as u32;
-        self.program(addr, &[0])
+        self.program_marker(self.page_addr(page) + MARKER_OFFSET as u32)
+    }
+
+    /// Programs the marker byte at `addr`, unless it is already: a mark retried after a flash
+    /// error may have been done, and a byte is only programmed once between erases.
+    fn program_marker(&mut self, addr: u32) -> Result<(), NorError<F::Error>> {
+        let mut marker = [0];
+        self.flash
+            .read(addr, &mut marker)
+            .map_err(NorError::Flash)?;
+        if marker[0] == 0xFF {
+            self.program(addr, &[0])?;
+        }
+        Ok(())
+    }
+
+    /// Marks the pages of `unmarked` obsolete. Stops at the first flash error, keeping the pages
+    /// left.
+    fn mark_unmarked(&mut self) -> Result<(), NorError<F::Error>> {
+        while let Some(&page) = self.unmarked.last() {
+            self.mark_obsolete(usize::from(page))?;
+            self.unmarked.pop();
+        }
+        Ok(())
     }
 }
 
@@ -288,6 +324,7 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
             objects: HashMap::new(),
             active: None,
             next_version: 0,
+            unmarked: Vec::new(),
         };
         for id in backend.scan()? {
             backend.rewrite(id)?;
@@ -327,9 +364,19 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
         unreachable!("an object has at least one page")
     }
 
+    /// Marks the first page of the object obsolete, then releases the others. If the flash fails
+    /// before the first page is marked, nothing changed: the object is still here.
     fn remove(&mut self, id: ObjectId) -> Result<(), Self::Error> {
-        let object = self.objects.remove(&id).ok_or(NorError::NotFound)?;
-        self.release(&object.pages)
+        let first = self.objects.get(&id).ok_or(NorError::NotFound)?.pages[0];
+        // An older version left unmarked would come back at mount once this one is gone.
+        self.mark_unmarked()?;
+        // Mount ignores a version with an obsolete page: the object is gone from flash, so it
+        // can go from RAM.
+        self.mark_obsolete(usize::from(first))?;
+        let object = self.objects.remove(&id).expect("found above");
+        self.sectors[Self::sector_of(usize::from(first))].live -= 1;
+        self.release(&object.pages[1..]);
+        Ok(())
     }
 
     /// In whole pages of 235 payload bytes. `capacity` leaves out the sector headers and the
