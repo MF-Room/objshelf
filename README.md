@@ -334,6 +334,7 @@ Requirements, guarantees, time and space complexity: module documentation in
   - skipped dirty pages, and pages that read back wrong, can eat into the GC reserve; GC refuses a
     victim whose live pages don't fit
   - peak RAM: `write` and `read` hold the whole serialized object, plus the page list
+- [ ] Examples: one with RTIC, and one on std
 - [x] Implement `ObjShelf` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names
   stored with the objects, LRU read cache with a RAM budget, changes kept in RAM until a flush
 - [x] RAM accounting: an object counts its heap with `get-size2`, spare capacity included, instead of a
