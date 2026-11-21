@@ -61,8 +61,14 @@
 //!   is still in RAM. A page or its commit byte that reads back wrong gets the page marked
 //!   obsolete and written again on the next free page. A sector header or its commit byte that
 //!   reads back wrong leaves its sector unformatted, and the least worn free sector is picked
-//!   again. After 3 tries, the write
-//!   fails with [`NorError::VerifyFailed`].
+//!   again. After 3 tries, the write fails with [`NorError::VerifyFailed`].
+//! - A write never takes the free sector kept for garbage collection, so garbage collection always
+//!   has a whole sector to move the live pages of its victim to. Pages that read back wrong can make a write
+//!   need more pages than it counted: when it runs out, it gives up the pages it wrote, collects
+//!   garbage and starts again. After 3 tries, it fails with [`NorError::NoSpace`]. Left: a move
+//!   whose free sector has pages that read back wrong can run out too, as a static wear leveling
+//!   move, which has no garbage to spare. The write then fails with [`NorError::NoSpace`], and a
+//!   retry collects the sector the move left half done.
 //! - Each sector header holds the version of the on-flash format: mount fails with
 //!   [`NorError::UnsupportedFormat`] on a sector of another version, instead of erasing it as
 //!   unformatted.
@@ -82,9 +88,10 @@
 //! | GC, per sector reclaimed | up to `3 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 3 small writes, 3 small reads | `O(S + P)` |
 //!
 //! A page or commit byte that reads back wrong costs one more page: a blank check, a write, a
-//! read-back and a 1-byte read and write, plus the commit again for a last page. A mark reads its
-//! byte first, as one retried after a flash error may be done already. Hash map operations are
-//! expected `O(1)`.
+//! read-back and a 1-byte read and write, plus the commit again for a last page. When that runs a
+//! write out of pages, it starts again after a garbage collection: the pages written so far, once
+//! more. A mark reads its byte first, as one retried after a flash error may be done already.
+//! Hash map operations are expected `O(1)`.
 //!
 //! Garbage collection only runs inside a `write` that lacks space, possibly for several sectors.
 //! When the wear gets uneven, it also moves one sector of data that never changes: the cost of
@@ -139,7 +146,8 @@ use super::{Backend, Usage, Wear, decode, type_tag};
 use crate::ObjectId;
 use layout::{MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE};
 
-/// Free sectors kept so garbage collection always has room to relocate live pages.
+/// Free sectors kept so garbage collection always has room to relocate live pages: writes never
+/// take them.
 const RESERVED_SECTORS: usize = 1;
 
 /// Static wear leveling: when the least worn sector holding data is this many erases behind the
@@ -148,7 +156,8 @@ const RESERVED_SECTORS: usize = 1;
 const WEAR_GAP: u32 = 100;
 
 /// Pages tried for one page of data, and sectors for one sector header, when they or their commit
-/// byte read back wrong after their write, before giving up with [`NorError::VerifyFailed`].
+/// byte read back wrong after their write, before giving up with [`NorError::VerifyFailed`]. Also
+/// the tries of a write that runs out of pages, before giving up with [`NorError::NoSpace`].
 const WRITE_ATTEMPTS: usize = 3;
 
 /// Configuration of a [`NorBackend`].

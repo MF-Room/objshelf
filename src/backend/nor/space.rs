@@ -5,6 +5,16 @@ use embedded_storage::nor_flash::NorFlash;
 use super::layout::{COMMIT_OFFSET, COMMITTED, MARKER_OFFSET, SectorHeader, is_blank};
 use super::{NorBackend, NorError, RESERVED_SECTORS, Sector, WRITE_ATTEMPTS};
 
+/// What a page is allocated for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Purpose {
+    /// A page of a new version of an object. It never takes the free sectors kept for garbage
+    /// collection (`RESERVED_SECTORS`).
+    Write,
+    /// A page moved by garbage collection, which can take any free sector.
+    Collect,
+}
+
 impl<F: NorFlash> NorBackend<F> {
     /// Allocated pages that hold no live data.
     pub(super) fn garbage(&self, sector: usize) -> usize {
@@ -64,7 +74,13 @@ impl<F: NorFlash> NorBackend<F> {
 
     /// Makes the least worn free sector the active one. If its header or its commit reads back
     /// wrong, the least worn free sector is picked again: the failed one now counts one more erase.
-    fn open_sector(&mut self) -> Result<usize, NorError<F::Error>> {
+    ///
+    /// For a write, fails with `NoSpace` if only the sectors kept for garbage collection are free:
+    /// pages that read back wrong made the write need more pages than `ensure_space` counted.
+    fn open_sector(&mut self, purpose: Purpose) -> Result<usize, NorError<F::Error>> {
+        if purpose == Purpose::Write && self.free_sectors() <= RESERVED_SECTORS {
+            return Err(NorError::NoSpace);
+        }
         for _ in 0..WRITE_ATTEMPTS {
             let sector = (0..self.sectors.len())
                 .filter(|&s| self.is_free(s))
@@ -95,11 +111,12 @@ impl<F: NorFlash> NorBackend<F> {
         &mut self,
         bytes: &[u8],
         commit: bool,
+        purpose: Purpose,
     ) -> Result<usize, NorError<F::Error>> {
         debug_assert!(bytes.len() <= MARKER_OFFSET);
         debug_assert!(!commit || bytes.len() <= COMMIT_OFFSET);
         for _ in 0..WRITE_ATTEMPTS {
-            let page = self.alloc_page()?;
+            let page = self.alloc_page(purpose)?;
             let addr = self.page_addr(page);
             // Until it reads back right: a flash error can leave it whole, it is marked later.
             self.unmarked.push(page as u16);
@@ -116,11 +133,11 @@ impl<F: NorFlash> NorBackend<F> {
 
     /// Returns a fully erased page. Pages are allocated in order inside a sector and never
     /// reused before the sector is erased.
-    fn alloc_page(&mut self) -> Result<usize, NorError<F::Error>> {
+    fn alloc_page(&mut self, purpose: Purpose) -> Result<usize, NorError<F::Error>> {
         loop {
             let sector = match self.active {
                 Some(s) if self.sectors[s].next_page < Self::PAGES_PER_SECTOR => s,
-                _ => self.open_sector()?,
+                _ => self.open_sector(purpose)?,
             };
             let page = sector * Self::PAGES_PER_SECTOR + self.sectors[sector].next_page;
             self.sectors[sector].next_page += 1;

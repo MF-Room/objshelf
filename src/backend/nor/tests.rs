@@ -790,6 +790,36 @@ fn a_sector_keeps_its_data_when_the_commit_of_its_header_decays() {
 }
 
 #[test]
+fn a_write_never_takes_the_free_sector_kept_for_garbage_collection() {
+    let mut backend = mount(SmallFlash::new(4));
+    for id in 1..=6 {
+        write(&mut backend, id, &bytes(id as u8, 100));
+    }
+    write(&mut backend, 1, &bytes(11, 100));
+    write(&mut backend, 2, &bytes(12, 100));
+    // Sector 0 holds 2 pages of garbage. The write fits in the last page of sector 2, the
+    // active one, and sector 3 is the only free sector.
+    assert_eq!(backend.active, Some(2));
+    assert_eq!(backend.active_free_pages(), 1);
+    assert_eq!(backend.free_sectors(), 1);
+    assert_eq!(backend.garbage(0), 2);
+
+    // That page reads back wrong. The write does not go on in sector 3: it collects sector 0,
+    // whose live page moves to sector 3, and starts again there.
+    backend.flash_mut().worn = vec![11 * PAGE_SIZE];
+    write(&mut backend, 3, &bytes(13, 100));
+    assert_eq!(backend.objects[&ObjectId(3)].pages, [14]);
+    assert_eq!(backend.free_sectors(), 1);
+    assert!(backend.is_free(0));
+
+    let mut backend = reboot(backend);
+    let expected = [11, 12, 13, 4, 5, 6];
+    for (id, seed) in (1..=6).zip(expected) {
+        assert_eq!(read(&mut backend, id), Some(bytes(seed, 100)));
+    }
+}
+
+#[test]
 fn a_page_that_reads_back_wrong_three_times_fails_the_write() {
     let mut backend = mount(SmallFlash::new(4));
     write(&mut backend, 1, &bytes(1, 100));

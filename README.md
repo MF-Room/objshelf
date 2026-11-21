@@ -235,7 +235,7 @@ in [`src/memory`](src/memory/mod.rs).
   whose obsolete mark fails are kept in a list and marked before the next write or removal. After a reboot,
   the failed operation may be done or not, as after a power cut.
 * Garbage collection relocates the live pages of the sector with the most garbage and erases it; one free
-  sector is kept for it. Ties go to the least worn sector.
+  sector is kept for it, which writes never take. Ties go to the least worn sector.
 * Wear: new pages go to the least worn free sector. Data that never changes would keep its sector out
   of the rotation, so when the least worn sector holding data is 100 erases behind the most worn one,
   garbage collection moves its data to the most worn free sector and erases it (static wear
@@ -245,7 +245,9 @@ in [`src/memory`](src/memory/mod.rs).
   RAM. A page or commit byte that reads back wrong gets the page marked obsolete and written again on the
   next free page; a sector header or its commit byte that reads back wrong leaves the sector unformatted,
   and another sector is opened. After 3 tries the write fails with `VerifyFailed`, and the object keeps
-  its previous value.
+  its previous value. Pages that read back wrong can make a write need more pages than it counted: rather
+  than take the free sector kept for garbage collection, it gives up its pages, collects garbage and starts
+  again (`NoSpace` after 3 tries).
 * Bit rot is detected, not corrected (littlefs has no error correction either): a page that decays after
   its write fails its CRC, so a read gives `Corrupt`. After a reboot, mount can't trust the page, so it
   sees an incomplete version and drops the object, which then reads as missing. A sector header that decays
@@ -341,9 +343,12 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [x] Commit byte: a version counts once its last page is committed, in a program of its own after all
   its pages read back right, so the weak bits of a cut write are never taken for data, first write
   included. A sector header has one too: one cut before its commit gets the sector erased again
+- [x] Writes never take the free sector kept for garbage collection: one that runs out of pages, as pages
+  that read back wrong took more than it counted, collects garbage and starts again
 - [ ] Edge cases:
-  - skipped dirty pages, and pages that read back wrong, can eat into the GC reserve; GC refuses a
-    victim whose live pages don't fit
+  - a static wear leveling move has no garbage to spare: a page that reads back wrong in the free sector
+    it moves to runs it out, and the write fails with `NoSpace` (a retry works). A garbage collection
+    move can run out the same way, with 2 such pages or more
   - peak RAM: `write` and `read` hold the whole serialized object, plus the page list
 - [ ] Examples: one with RTIC, and one on std
 - [x] Implement `ObjShelf` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names

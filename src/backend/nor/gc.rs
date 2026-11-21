@@ -7,6 +7,7 @@ use core::cmp::Reverse;
 use embedded_storage::nor_flash::NorFlash;
 
 use super::layout::{MARKER_OFFSET, PageHeader};
+use super::space::Purpose;
 use super::{NorBackend, NorError, WEAR_GAP};
 use crate::ObjectId;
 
@@ -128,7 +129,7 @@ impl<F: NorFlash> NorBackend<F> {
             // erased, mount sees two copies and keeps one, the committed one for a last page.
             // The old copy no longer counts as live, so the RAM state stays right if a later
             // relocation fails.
-            let new = self.write_page(&bytes[..MARKER_OFFSET], false)?;
+            let new = self.write_page(&bytes[..MARKER_OFFSET], false, Purpose::Collect)?;
             if let Some(object) = self.objects.get_mut(&id) {
                 object.pages[slot] = new as u16;
             }

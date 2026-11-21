@@ -5,7 +5,8 @@ use alloc::vec::Vec;
 use embedded_storage::nor_flash::NorFlash;
 
 use super::layout::{PAYLOAD_SIZE, PageHeader};
-use super::{NorBackend, NorError, Object};
+use super::space::Purpose;
+use super::{NorBackend, NorError, Object, WRITE_ATTEMPTS};
 use crate::ObjectId;
 
 impl<F: NorFlash> NorBackend<F> {
@@ -42,6 +43,11 @@ impl<F: NorFlash> NorBackend<F> {
 
     /// Writes `data`, the object `id` serialized with its name, as its new version, then releases
     /// the old one. On an error, the object keeps its old version.
+    ///
+    /// The write never takes the free sector kept for garbage collection. Pages that read back
+    /// wrong can make it need more pages than `ensure_space` counted, so it can run out: it then
+    /// gives up the pages it wrote, collects garbage and starts again, up to `WRITE_ATTEMPTS`
+    /// times.
     pub(super) fn write_data(
         &mut self,
         id: ObjectId,
@@ -49,33 +55,15 @@ impl<F: NorFlash> NorBackend<F> {
     ) -> Result<(), NorError<F::Error>> {
         let count = data.len().div_ceil(PAYLOAD_SIZE).max(1);
         let header_count = u16::try_from(count).map_err(|_| NorError::NoSpace)?;
-        self.mark_unmarked()?;
-        self.ensure_space(count)?;
-
-        let version = self.next_version;
-        self.next_version += 1;
-        let mut pages = Vec::with_capacity(count);
-        for index in 0..count {
-            let chunk = &data[(index * PAYLOAD_SIZE).min(data.len())
-                ..((index + 1) * PAYLOAD_SIZE).min(data.len())];
-            let header = PageHeader {
-                index: index as u16,
-                object_id: id.0,
-                version,
-                count: header_count,
-                len: chunk.len() as u16,
-            };
-            // The commit, in the last page, once all the others read back right.
-            match self.write_page(&header.encode(chunk), index + 1 == count) {
-                Ok(page) => pages.push(page as u16),
-                Err(error) => {
-                    // An incomplete version: the page that failed may be whole anyway, with its
-                    // commit, which completes it if it was the last one.
-                    self.unmarked.extend(pages);
-                    return Err(error);
-                }
+        let mut attempt = 1;
+        let (version, pages) = loop {
+            self.mark_unmarked()?;
+            self.ensure_space(count)?;
+            match self.write_version(id, data, header_count) {
+                Err(NorError::NoSpace) if attempt < WRITE_ATTEMPTS => attempt += 1,
+                result => break result?,
             }
-        }
+        };
 
         // Every page is on flash and committed: the new version is complete, the old one can go.
         for &page in &pages {
@@ -85,6 +73,41 @@ impl<F: NorFlash> NorBackend<F> {
             self.release(&old.pages);
         }
         Ok(())
+    }
+
+    /// Writes the `count` pages of a new version of the object `id`, the last one committed.
+    /// Returns the version and its pages. On an error, the pages written go to `unmarked`.
+    fn write_version(
+        &mut self,
+        id: ObjectId,
+        data: &[u8],
+        count: u16,
+    ) -> Result<(u32, Vec<u16>), NorError<F::Error>> {
+        let version = self.next_version;
+        self.next_version += 1;
+        let mut pages = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let at = usize::from(index) * PAYLOAD_SIZE;
+            let chunk = &data[at.min(data.len())..(at + PAYLOAD_SIZE).min(data.len())];
+            let header = PageHeader {
+                index,
+                object_id: id.0,
+                version,
+                count,
+                len: chunk.len() as u16,
+            };
+            // The commit, in the last page, once all the others read back right.
+            match self.write_page(&header.encode(chunk), index + 1 == count, Purpose::Write) {
+                Ok(page) => pages.push(page as u16),
+                Err(error) => {
+                    // An incomplete version: the page that failed may be whole anyway, with its
+                    // commit, which completes it if it was the last one.
+                    self.unmarked.extend(pages);
+                    return Err(error);
+                }
+            }
+        }
+        Ok((version, pages))
     }
 
     /// Releases the pages of a replaced or removed version: they stop counting as live, and are
