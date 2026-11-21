@@ -3,9 +3,9 @@
 //! The region is split in sectors (`NorFlash::ERASE_SIZE`), and sectors in 256-byte pages. Page 0
 //! of a sector holds the sector header, the other pages hold object data.
 //!
-//! Every byte is programmed at most once between two erases, and only from `0xFF`: the markers set
-//! after a page is written (page obsolete, sector retired) are the last byte of the page, which the
-//! first write leaves erased.
+//! Every byte is programmed at most once between two erases, and only from `0xFF`: the bytes set
+//! after a page is written (the commit of a version, the obsolete and retired markers) are at the
+//! end of the page, which the first write leaves erased.
 
 use crate::backend::crc32;
 
@@ -15,10 +15,16 @@ pub(super) const PAGE_SIZE: usize = 256;
 /// Offset of the marker byte, `0xFF` until the page is obsolete or the sector retired.
 pub(super) const MARKER_OFFSET: usize = PAGE_SIZE - 1;
 
+/// Offset of the commit byte in the last page of a version: programmed to `COMMITTED` once all
+/// the pages of the version read back right, in a program of its own.
+pub(super) const COMMIT_OFFSET: usize = MARKER_OFFSET - 1;
+
+pub(super) const COMMITTED: u8 = 0x00;
+
 const PAGE_HEADER_SIZE: usize = 20;
 
 /// Object bytes in one data page.
-pub(super) const PAYLOAD_SIZE: usize = MARKER_OFFSET - PAGE_HEADER_SIZE;
+pub(super) const PAYLOAD_SIZE: usize = COMMIT_OFFSET - PAGE_HEADER_SIZE;
 
 // `0x4F` is ASCII `O`, for objshelf, and `0x53` is `S`, for sector. Neither magic is all `0xFF`
 // (erased) or all `0x00`, and a CRC follows each of them.
@@ -42,7 +48,8 @@ const SECTOR_HEADER_SIZE: usize = 12;
 /// 12      2     count      number of pages of this version
 /// 14      2     len        payload bytes in this page
 /// 16      4     crc        CRC32 of bytes 0..16 and the payload
-/// 20      235   payload
+/// 20      234   payload
+/// 254     1     commit     COMMITTED in the last page of a version, once committed
 /// 255     1     obsolete   0xFF while the page is live
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,10 +62,10 @@ pub(super) struct PageHeader {
 }
 
 impl PageHeader {
-    /// Bytes to program for this page: everything but the obsolete marker.
-    pub(super) fn encode(&self, payload: &[u8]) -> [u8; MARKER_OFFSET] {
+    /// Bytes to program for this page: everything but the commit byte and the obsolete marker.
+    pub(super) fn encode(&self, payload: &[u8]) -> [u8; COMMIT_OFFSET] {
         debug_assert_eq!(payload.len(), usize::from(self.len));
-        let mut bytes = [0xFF; MARKER_OFFSET];
+        let mut bytes = [0xFF; COMMIT_OFFSET];
         bytes[0..2].copy_from_slice(&PAGE_MAGIC.to_le_bytes());
         bytes[2..4].copy_from_slice(&self.index.to_le_bytes());
         bytes[4..8].copy_from_slice(&self.object_id.to_le_bytes());
@@ -145,6 +152,25 @@ pub(super) fn is_obsolete(page: &[u8; PAGE_SIZE]) -> bool {
     page[MARKER_OFFSET] != 0xFF
 }
 
+/// State of the commit byte of a page, which only the last page of a version programs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Commit {
+    /// Erased: the version is not committed.
+    Erased,
+    /// Neither erased nor `COMMITTED`: the power was cut while committing. The version counts,
+    /// as its pages were whole, but the commit byte can be weak.
+    Partial,
+    Programmed,
+}
+
+pub(super) fn commit_of(page: &[u8; PAGE_SIZE]) -> Commit {
+    match page[COMMIT_OFFSET] {
+        0xFF => Commit::Erased,
+        COMMITTED => Commit::Programmed,
+        _ => Commit::Partial,
+    }
+}
+
 pub(super) fn is_blank(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == 0xFF)
 }
@@ -171,10 +197,20 @@ mod tests {
             len: 4,
         };
         let mut page = [0xFF; PAGE_SIZE];
-        page[..MARKER_OFFSET].copy_from_slice(&header.encode(b"data"));
+        page[..COMMIT_OFFSET].copy_from_slice(&header.encode(b"data"));
         assert_eq!(PageHeader::decode(&page), Some(header));
         assert_eq!(header.payload(&page), b"data");
         assert!(!is_obsolete(&page));
+        assert_eq!(commit_of(&page), Commit::Erased);
+
+        // The commit and the obsolete marker are outside the CRC.
+        page[COMMIT_OFFSET] = 0x0F;
+        assert_eq!(commit_of(&page), Commit::Partial);
+        page[COMMIT_OFFSET] = COMMITTED;
+        assert_eq!(commit_of(&page), Commit::Programmed);
+        page[MARKER_OFFSET] = 0;
+        assert_eq!(PageHeader::decode(&page), Some(header));
+        assert!(is_obsolete(&page));
 
         page[21] ^= 1;
         assert_eq!(PageHeader::decode(&page), None);

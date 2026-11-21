@@ -63,7 +63,7 @@ pub(crate) struct MockFlash<const ERASE_SIZE: usize> {
     dead: bool,
     /// Runs at the start of each program operation, as an interrupt during a write.
     pub(crate) on_write: Option<Box<dyn FnMut() + Send>>,
-    /// Worn pages: their byte 0 no longer programs and stays `0xFF`.
+    /// Worn bytes, by offset: they no longer program and stay `0xFF`.
     pub(super) worn: Vec<usize>,
     /// Erases a sector endures: past them, its writes silently do nothing, as on a chip past its
     /// rated endurance. `None`: it never wears out.
@@ -251,7 +251,7 @@ impl<const ERASE_SIZE: usize> NorFlash for MockFlash<ERASE_SIZE> {
             return self.end(error);
         }
         for at in part(range.clone(), done) {
-            if at % PAGE_SIZE == 0 && self.worn.contains(&(at / PAGE_SIZE)) {
+            if self.worn.contains(&at) {
                 continue;
             }
             self.data[at] &= bytes[at - range.start];

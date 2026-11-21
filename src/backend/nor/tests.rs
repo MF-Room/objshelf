@@ -5,7 +5,9 @@ use alloc::vec::Vec;
 use crc::{CRC_32_ISO_HDLC, Crc};
 use serde::{Deserialize, Serialize};
 
-use super::layout::{FORMAT_VERSION, PAGE_SIZE, PageHeader};
+use super::layout::{
+    COMMIT_OFFSET, COMMITTED, FORMAT_VERSION, PAGE_SIZE, PAYLOAD_SIZE, PageHeader,
+};
 use super::mock::{Cut, Done, MockError, MockFlash};
 use super::{NorBackend, NorConfig, NorError, WEAR_GAP};
 use crate::ObjectId;
@@ -149,7 +151,7 @@ fn garbage_collection_reuses_space() {
 #[test]
 fn usage() {
     // 4 sectors of 3 data pages, one kept for garbage collection.
-    let page = 235;
+    let page = PAYLOAD_SIZE;
     let mut backend = mount(SmallFlash::new(4));
     let empty = Usage {
         capacity: 9 * page,
@@ -609,12 +611,13 @@ fn updates() -> Vec<Op> {
 }
 
 #[test]
-fn a_page_cut_in_an_update_or_a_relocation_is_written_again() {
+fn a_page_cut_in_any_write_is_not_live_as_the_cut_left_it() {
     let ops = updates();
     let first_update = run(SmallFlash::new(3), &ops[..3]).0.ops;
     let total = run(SmallFlash::new(3), &ops).0.ops;
-    let mut weak = 0;
-    for at in first_update..total {
+    // Pages left whole by a cut in a first write, and in an update or a relocation.
+    let (mut weak_first, mut weak_later) = (0, 0);
+    for at in 0..total {
         // Only the first half of the cut write is done. When that holds the header and payload,
         // the page reads whole, as a page whose write the cut left with weak bits.
         let (flash, _) = run(SmallFlash::new(3).cut_at(at, Cut::FirstHalf), &ops);
@@ -626,12 +629,17 @@ fn a_page_cut_in_an_update_or_a_relocation_is_written_again() {
         let left: [u8; PAGE_SIZE] = flash.data[cut * PAGE_SIZE..][..PAGE_SIZE]
             .try_into()
             .unwrap();
-        // A whole page, not a marker.
+        // A whole page, not a marker or a commit.
         if (offset as usize).is_multiple_of(PAGE_SIZE) && PageHeader::decode(&left).is_some() {
-            weak += 1;
+            if at < first_update {
+                weak_first += 1;
+            } else {
+                weak_later += 1;
+            }
         }
 
-        // The page can be erased and written again by the mount, as with any other page.
+        // A first write is dropped, an update or a relocation written again. The page can be
+        // erased and written again by the mount, as with any other page.
         let backend = mount(SmallFlash::with_data(flash.data));
         let mut live = backend.objects.values().flat_map(|object| &object.pages);
         let left_live = live.any(|&page| usize::from(page) == cut)
@@ -641,7 +649,29 @@ fn a_page_cut_in_an_update_or_a_relocation_is_written_again() {
             "cut at operation {at}: page {cut} is live as the cut left it"
         );
     }
-    assert!(weak > 0);
+    assert!(weak_first > 0 && weak_later > 0);
+}
+
+#[test]
+fn a_commit_byte_cut_half_programmed_gets_the_object_written_again() {
+    let mut backend = mount(SmallFlash::new(4));
+    write(&mut backend, 1, &bytes(1, 300));
+    let last = *backend.objects[&ObjectId(1)].pages.last().unwrap();
+    // The cut left some bits of the commit byte programmed, maybe weak.
+    backend.flash.data[usize::from(last) * PAGE_SIZE + COMMIT_OFFSET] = 0x0F;
+
+    let mut backend = reboot(backend);
+    assert_eq!(read(&mut backend, 1), Some(bytes(1, 300)));
+    let pages = backend.objects[&ObjectId(1)].pages.clone();
+    assert!(!pages.contains(&last), "{pages:?} still holds page {last}");
+    let new_last = usize::from(*pages.last().unwrap());
+    assert_eq!(
+        backend.flash.data[new_last * PAGE_SIZE + COMMIT_OFFSET],
+        COMMITTED
+    );
+
+    let backend = reboot(backend);
+    assert_eq!(backend.flash.ops, 0);
 }
 
 #[test]
@@ -654,16 +684,31 @@ fn a_clean_mount_writes_nothing() {
 fn a_page_that_reads_back_wrong_is_written_on_the_next_page() {
     let mut flash = SmallFlash::new(4);
     // The first data page of sector 0, the first sector opened.
-    flash.worn = vec![1];
+    flash.worn = vec![PAGE_SIZE];
     let mut backend = mount(flash);
     write(&mut backend, 1, &bytes(1, 100));
     assert_eq!(backend.objects[&ObjectId(1)].pages, [2]);
-    assert_eq!(backend.usage().reclaimable, 235);
+    assert_eq!(backend.usage().reclaimable, PAYLOAD_SIZE);
 
     let mut backend = reboot(backend);
     assert_eq!(read(&mut backend, 1), Some(bytes(1, 100)));
     // The failed page waits for garbage collection.
-    assert_eq!(backend.usage().reclaimable, 235);
+    assert_eq!(backend.usage().reclaimable, PAYLOAD_SIZE);
+}
+
+#[test]
+fn a_commit_byte_that_reads_back_wrong_moves_the_last_page() {
+    let mut flash = SmallFlash::new(4);
+    // The commit byte of the second data page of sector 0, the first sector opened.
+    flash.worn = vec![2 * PAGE_SIZE + COMMIT_OFFSET];
+    let mut backend = mount(flash);
+    write(&mut backend, 1, &bytes(1, 300));
+    assert_eq!(backend.objects[&ObjectId(1)].pages, [1, 3]);
+    assert_eq!(backend.usage().reclaimable, PAYLOAD_SIZE);
+
+    let mut backend = reboot(backend);
+    assert_eq!(read(&mut backend, 1), Some(bytes(1, 300)));
+    assert_eq!(backend.flash.ops, 0);
 }
 
 #[test]
@@ -688,7 +733,10 @@ fn a_page_that_reads_back_wrong_three_times_fails_the_write() {
     let mut backend = mount(SmallFlash::new(4));
     write(&mut backend, 1, &bytes(1, 100));
     // Every data page wears out, header pages excepted.
-    backend.flash_mut().worn = (0..16).filter(|page| page % 4 != 0).collect();
+    backend.flash_mut().worn = (0..16)
+        .filter(|page| page % 4 != 0)
+        .map(|page| page * PAGE_SIZE)
+        .collect();
     let written = backend.write(ObjectId(2), "2", &bytes(2, 100));
     assert!(
         matches!(written, Err(NorError::VerifyFailed)),
@@ -706,7 +754,7 @@ fn a_page_that_reads_back_wrong_three_times_fails_the_write() {
 fn worn_pages_lose_nothing() {
     let mut flash = SmallFlash::new(4);
     // A worn data page in three of the four sectors.
-    flash.worn = vec![2, 7, 13];
+    flash.worn = vec![2 * PAGE_SIZE, 7 * PAGE_SIZE, 13 * PAGE_SIZE];
     let mut backend = mount(flash);
     // Never updated: garbage collection moves it, and some of its moves hit a worn page.
     write(&mut backend, 9, &bytes(9, 100));

@@ -193,7 +193,7 @@ stays in RAM for the next flush.
   the objects stored before then give `WrongType`. Changing the fields of a type doesn't: after a firmware
   update, converting the stored data is up to the app.
 * **Limits.** An object must fit in the RAM budget (`TooBig` otherwise) and, serialized with its name and
-  type tag, in the free space of the backend: at most 65535 pages of 235 bytes (about 15 MiB) on NOR. An
+  type tag, in the free space of the backend: at most 65535 pages of 234 bytes (about 15 MiB) on NOR. An
   object that doesn't fit fails its flush with `NoSpace`, and the flush goes on with the others. A read or
   write also holds the whole serialized object on the heap while it runs. The NOR region is aligned to the
   erase size, has at least 2 sectors (one stays free for garbage collection) and at most 16 MiB, and is
@@ -212,14 +212,18 @@ in [`src/memory`](src/memory/mod.rs).
 (chips with internal ECC are not supported for now). Every operation blocks until done.
 
 * Objects are serialized with postcard, their name and type tag first, and split in 256-byte pages
-  (20-byte header, 235-byte payload, 1-byte obsolete marker). Page 0 of each sector holds a sector header
-  with the format version and the erase count. A sector of another format version makes mount fail with
-  `UnsupportedFormat`, instead of being erased as unformatted.
+  (20-byte header, 234-byte payload, 1-byte commit, 1-byte obsolete marker). Page 0 of each sector holds a
+  sector header with the format version and the erase count. A sector of another format version makes mount
+  fail with `UnsupportedFormat`, instead of being erased as unformatted.
 * RAM index: `ObjectId` → current version and page list (`hashbrown::HashMap`, needs a heap).
-* Each write gets a new global version. A version counts only once all its pages are on flash, so a power
-  cut leaves either the old or the new value. Replaced and removed pages are then marked obsolete.
-* A page whose write was cut can read right and lose weak bits later. When the cut hit an update or a
-  garbage collection, the old copy is still there at mount, which then writes the object again.
+* Each write gets a new global version. A version counts only once all its pages are on flash and its last
+  page is committed, so a power cut leaves either the old or the new value. Replaced and removed pages are
+  then marked obsolete.
+* A program cut by a power loss can leave weak bits, which read right and flip later. So once all the pages
+  of a version read back right, a program of its own sets the commit byte of the last page: a write whose
+  pages were cut never counts, even if they read right. When the cut hit the commit byte, leaving it partly
+  programmed, or a garbage collection copying a page, mount writes the object again. Left: a commit byte
+  programmed whole but weak; all 8 bits have to flip back for the version to stop counting.
 * Every byte is programmed once between erases, and only from `0xFF`: a mark retried after a flash error
   reads its byte first.
 * A flash error that is not a power cut fails the operation without changing what the backend reports: a
@@ -234,10 +238,13 @@ in [`src/memory`](src/memory/mod.rs).
   garbage collection moves its data to the most worn free sector and erases it (static wear
   leveling). A sector found without a header at mount (an erase cut by a power loss) gets the average
   erase count of the others instead of 0, so it is not reused first again and again.
-* Each page and sector header is read back right after its write, while the data is still in RAM. A page
-  that reads back wrong is marked obsolete and written again on the next free page; a sector header
-  that reads back wrong leaves the sector unformatted, and another sector is opened. After 3 tries the
-  write fails with `VerifyFailed`, and the object keeps its previous value.
+* Each page, commit byte and sector header is read back right after its write, while the data is still in
+  RAM. A page or commit byte that reads back wrong gets the page marked obsolete and written again on the
+  next free page; a sector header that reads back wrong leaves the sector unformatted, and another sector
+  is opened. After 3 tries the write fails with `VerifyFailed`, and the object keeps its previous value.
+* Bit rot is detected, not corrected (littlefs has no error correction either): a page that decays after
+  its write fails its CRC, so a read gives `Corrupt`. After a reboot, mount can't trust the page, so it
+  sees an incomplete version and drops the object, which then reads as missing.
 * Mount reads the whole region and rebuilds the index (2 MiB at 25 MHz: about 0.7 s).
 
 ### Lifetime
@@ -249,7 +256,7 @@ them over all the sectors, so:
 lifetime ≈ sectors × endurance × pages written per erase / pages written per day
 ```
 
-Each flush writes every modified object once, in pages of 235 bytes (name and value serialized).
+Each flush writes every modified object once, in pages of 234 bytes (name and value serialized).
 Pages written per erase depend on how full the flash is: a fuller flash leaves less garbage in each
 sector, so garbage collection moves more live pages for each erase. Measured with 4 KiB sectors and
 one-page objects updated at random (`cargo test --release -- --ignored --nocapture pages_per_erase`):
@@ -326,10 +333,10 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [x] Format version in the sector header: mount fails on another version instead of erasing it
 - [x] Flash errors: the RAM index never gets ahead of the flash, so a failed operation changes nothing
   the backend reports and a retry finishes it; no remount
+- [x] Commit byte: a version counts once its last page is committed, in a program of its own after all
+  its pages read back right, so the weak bits of a cut write are never taken for data, first write
+  included
 - [ ] Edge cases:
-  - a page that decays after its write only shows up as `Corrupt` on read, with no fallback: bit rot,
-    or weak bits after a cut at the very end of an object's first write (an update or a garbage
-    collection cut that way is written again at mount)
   - a corrupted sector header makes mount ignore the whole sector and its objects
   - skipped dirty pages, and pages that read back wrong, can eat into the GC reserve; GC refuses a
     victim whose live pages don't fit

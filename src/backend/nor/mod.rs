@@ -2,8 +2,9 @@
 //!
 //! Objects are serialized with postcard, their name and the 4-byte tag of their type first (see
 //! [`type_tag`]), and split in 256-byte pages (see `layout`). Each write of an object gets a new
-//! global version, written to free pages. A version only counts once all its pages are on flash,
-//! so after a power cut an object holds either its old or its new value.
+//! global version, written to free pages. A version only counts once all its pages are on flash
+//! and its last page is committed, so after a power cut an object holds either its old or its new
+//! value.
 //! Replaced and removed pages are marked obsolete. Garbage collection relocates the live pages of
 //! the sector with the most garbage, then erases it.
 //!
@@ -45,14 +46,18 @@
 //!   `remove` marks a page of the object obsolete before it forgets the object, and a page whose
 //!   obsolete mark fails is kept in a list, marked before the next `write` or `remove`. Such a
 //!   mark, for a version already replaced, doesn't fail the `write`.
-//! - A page write cut by a power loss can leave weak bits: the page reads right, then turns
-//!   `Corrupt` later. When the cut hit an update or a garbage collection, mount sees it and writes
-//!   the object again. When it hit the very end of an object's first write, nothing tells.
-//! - Every page and sector header is read back right after its write, while the data is still in
-//!   RAM. A page that reads back wrong is marked obsolete and written again on the next free
-//!   page. A sector header that reads back wrong leaves its sector unformatted, and the least
-//!   worn free sector is picked again. After 3 tries, the write fails with
-//!   [`NorError::VerifyFailed`].
+//! - A program cut by a power loss can leave weak bits: they read right, then flip later. So a
+//!   version only counts once its commit byte, in its last page, is programmed: a program of its
+//!   own, done once all the pages of the version read back right. A write whose pages were cut is
+//!   never taken for done, even if they read right. When the cut hit the commit byte, leaving it
+//!   partly programmed, or a garbage collection copying a page, mount writes the object again.
+//!   Left: a commit byte that the cut left programmed but weak; all 8 bits have to flip back for
+//!   the version to stop counting.
+//! - Every page, commit byte and sector header is read back right after its write, while the data
+//!   is still in RAM. A page or commit byte that reads back wrong gets the page marked obsolete
+//!   and written again on the next free page. A sector header that reads back wrong leaves its
+//!   sector unformatted, and the least worn free sector is picked again. After 3 tries, the write
+//!   fails with [`NorError::VerifyFailed`].
 //! - Each sector header holds the version of the on-flash format: mount fails with
 //!   [`NorError::UnsupportedFormat`] on a sector of another version, instead of erasing it as
 //!   unformatted.
@@ -60,20 +65,21 @@
 //! # Time
 //!
 //! `N` pages in the region, `S` sectors, `P` pages per sector (16 with 4 KiB sectors), `k` pages
-//! of the object (`ceil(len / 235)`, at least 1), `k'` pages of its previous version.
+//! of the object (`ceil(len / 234)`, at least 1), `k'` pages of its previous version.
 //!
 //! | Operation | Flash | CPU |
 //! |---|---|---|
 //! | `mount` | reads all `N` pages; after a crash, one 1-byte read and write per stale page and a `write` of each object that had some | `O(N + S)` |
 //! | `read` | `k` page reads | `O(len)` |
-//! | `write`, no GC | `k` blank-check reads, `k` page writes, `k` read-backs, `k'` 1-byte reads and writes | `O(len + S)` |
+//! | `write`, no GC | `k` blank-check reads, `k` page writes, `k` read-backs, a 1-byte write and read-back (the commit), `k'` 1-byte reads and writes | `O(len + S)` |
 //! | `remove` | `k'` 1-byte reads and writes | `O(k')` |
 //! | `usage` | none | `O(S)` |
 //! | GC, per sector reclaimed | up to `3 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 2 small writes, 2 small reads | `O(S + P)` |
 //!
-//! A page that reads back wrong costs one more page: a blank check, a write, a read-back and a
-//! 1-byte read and write. A mark reads its byte first, as one retried after a flash error may be
-//! done already. Hash map operations are expected `O(1)`.
+//! A page or commit byte that reads back wrong costs one more page: a blank check, a write, a
+//! read-back and a 1-byte read and write, plus the commit again for a last page. A mark reads its
+//! byte first, as one retried after a flash error may be done already. Hash map operations are
+//! expected `O(1)`.
 //!
 //! Garbage collection only runs inside a `write` that lacks space, possibly for several sectors.
 //! When the wear gets uneven, it also moves one sector of data that never changes: the cost of
@@ -97,9 +103,9 @@
 //! - `read` and `write`: the whole serialized object, plus a 256 B page buffer on the stack;
 //! - `mount`, temporarily: 4 B per page found, 8 B per sector.
 //!
-//! Flash: 235 payload bytes per 256-byte page, page 0 of each sector for its header, one sector
+//! Flash: 234 payload bytes per 256-byte page, page 0 of each sector for its header, one sector
 //! kept free, at least one page per object. On a whole W25Q16JV (512 sectors) that is at most
-//! 511 × 15 × 235 B ≈ 1.72 MiB of live data. An update also needs room for its new version before
+//! 511 × 15 × 234 B ≈ 1.71 MiB of live data. An update also needs room for its new version before
 //! the old one is released. An object, serialized with its name and type tag, takes at most 65535
 //! pages (about 15 MiB) and must fit in the free space: `write` returns [`NorError::NoSpace`]
 //! otherwise.
@@ -165,9 +171,9 @@ pub enum NorError<E> {
     /// A sector holds another version of the on-flash format, the one given, written by other
     /// firmware: the mount fails without erasing anything.
     UnsupportedFormat(u16),
-    /// A page of data read back wrong right after its write on 3 pages in a row, or a sector
-    /// header in 3 sectors: the flash is probably worn out. Nothing was replaced: the object keeps
-    /// its previous value.
+    /// A page of data, or its commit byte, read back wrong right after its write on 3 pages in a
+    /// row, or a sector header in 3 sectors: the flash is probably worn out. Nothing was replaced:
+    /// the object keeps its previous value.
     VerifyFailed,
 }
 
@@ -379,7 +385,7 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
         Ok(())
     }
 
-    /// In whole pages of 235 payload bytes. `capacity` leaves out the sector headers and the
+    /// In whole pages of 234 payload bytes. `capacity` leaves out the sector headers and the
     /// sector kept for garbage collection; `free` is what a write can use without collecting.
     fn usage(&self) -> Usage {
         let user_sectors = self.sectors.len() - RESERVED_SECTORS;

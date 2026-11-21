@@ -2,7 +2,7 @@
 
 use embedded_storage::nor_flash::NorFlash;
 
-use super::layout::{MARKER_OFFSET, SectorHeader, is_blank};
+use super::layout::{COMMIT_OFFSET, COMMITTED, MARKER_OFFSET, SectorHeader, is_blank};
 use super::{NorBackend, NorError, RESERVED_SECTORS, Sector, WRITE_ATTEMPTS};
 
 impl<F: NorFlash> NorBackend<F> {
@@ -83,17 +83,25 @@ impl<F: NorFlash> NorBackend<F> {
         Ok(true)
     }
 
-    /// Writes `bytes`, a data page without its marker, to a free page, and reads it back. A page
-    /// that reads back wrong is marked obsolete, and the write goes to the next free page.
-    /// Returns the page written.
-    pub(super) fn write_page(&mut self, bytes: &[u8]) -> Result<usize, NorError<F::Error>> {
+    /// Writes `bytes`, a data page without its marker, to a free page, and reads it back. With
+    /// `commit`, the last page of a version, it then programs the commit byte, in a program of its
+    /// own, and reads it back too. A page that reads back wrong is marked obsolete, and the write
+    /// goes to the next free page. Returns the page written.
+    pub(super) fn write_page(
+        &mut self,
+        bytes: &[u8],
+        commit: bool,
+    ) -> Result<usize, NorError<F::Error>> {
         debug_assert!(bytes.len() <= MARKER_OFFSET);
+        debug_assert!(!commit || bytes.len() <= COMMIT_OFFSET);
         for _ in 0..WRITE_ATTEMPTS {
             let page = self.alloc_page()?;
             let addr = self.page_addr(page);
             // Until it reads back right: a flash error can leave it whole, it is marked later.
             self.unmarked.push(page as u16);
-            if self.program_checked(addr, bytes)? {
+            if self.program_checked(addr, bytes)?
+                && (!commit || self.program_checked(addr + COMMIT_OFFSET as u32, &[COMMITTED])?)
+            {
                 self.unmarked.pop();
                 return Ok(page);
             }

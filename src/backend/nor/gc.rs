@@ -124,10 +124,11 @@ impl<F: NorFlash> NorBackend<F> {
             if !live {
                 continue;
             }
-            // Same bytes, header included: until the sector is erased, mount sees two identical
-            // copies and keeps one. The old copy no longer counts as live, so the RAM state
-            // stays right if a later relocation fails.
-            let new = self.write_page(&bytes[..MARKER_OFFSET])?;
+            // Same bytes, header and commit included, in one program: until the sector is
+            // erased, mount sees two copies and keeps one, the committed one for a last page.
+            // The old copy no longer counts as live, so the RAM state stays right if a later
+            // relocation fails.
+            let new = self.write_page(&bytes[..MARKER_OFFSET], false)?;
             if let Some(object) = self.objects.get_mut(&id) {
                 object.pages[slot] = new as u16;
             }

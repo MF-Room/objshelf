@@ -1,5 +1,5 @@
 //! Mount: rebuilds the RAM state from flash, then writes again the objects that a power cut
-//! may have left with a weak page.
+//! may have left with a weak page or commit byte.
 
 use alloc::collections::BTreeSet;
 use alloc::vec;
@@ -8,7 +8,9 @@ use alloc::vec::Vec;
 use embedded_storage::nor_flash::NorFlash;
 use hashbrown::HashMap;
 
-use super::layout::{FORMAT_VERSION, PageHeader, SectorHeader, is_blank, is_obsolete};
+use super::layout::{
+    Commit, FORMAT_VERSION, PageHeader, SectorHeader, commit_of, is_blank, is_obsolete,
+};
 use super::{NorBackend, NorError, Object};
 use crate::ObjectId;
 
@@ -16,17 +18,24 @@ use crate::ObjectId;
 struct Candidate {
     version: u32,
     pages: Vec<Option<u16>>,
+    /// Commit byte of the last page found.
+    commit: Commit,
 }
 
 impl<F: NorFlash> NorBackend<F> {
     /// Rebuilds the RAM state from flash and marks every stale page obsolete, so that each
-    /// object has a single version left on flash. Returns the objects that had stale pages.
+    /// object has a single version left on flash. Returns the objects to write again.
     ///
-    /// Stale pages are what a power cut leaves behind, next to the last page it hit, which can be
-    /// weak. In an update, the old version is not obsolete yet; in a relocation, the moved page
-    /// still has its first copy. Neither tells a weak page from a sound one, so the objects
-    /// returned are written again. The first write of an object leaves no stale page: cut at its
-    /// very end, its last page can be weak and is not caught.
+    /// A version counts once all its pages are there and its last page is committed. A program
+    /// cut by a power loss can leave weak bits, which read right and flip later. The commit is
+    /// programmed once all the pages read back right, so the pages of a committed version are
+    /// whole. What a cut can still leave weak, and the object is written again for:
+    /// - a commit byte, when the cut hit the commit: if it is left partly programmed, it shows;
+    /// - a page copied by a garbage collection, in one program with its commit byte: it then has
+    ///   two copies, as its sector is not erased yet.
+    ///
+    /// An object with any other stale page is written again too: an uncommitted version can be
+    /// the rewrite of an earlier mount, cut before its commit.
     pub(super) fn scan(&mut self) -> Result<BTreeSet<ObjectId>, NorError<F::Error>> {
         let mut found: HashMap<ObjectId, Vec<Candidate>> = HashMap::new();
         let mut stale = Vec::new();
@@ -70,27 +79,49 @@ impl<F: NorFlash> NorBackend<F> {
                     continue;
                 }
 
-                let candidates = found.entry(ObjectId(header.object_id)).or_default();
+                let id = ObjectId(header.object_id);
+                let candidates = found.entry(id).or_default();
                 let at = match candidates.iter().position(|c| c.version == header.version) {
                     Some(at) => at,
                     None => {
                         candidates.push(Candidate {
                             version: header.version,
                             pages: vec![None; usize::from(header.count)],
+                            commit: Commit::Erased,
                         });
                         candidates.len() - 1
                     }
                 };
                 let candidate = &mut candidates[at];
                 let slot = usize::from(header.index);
-                // A duplicate left by a cut garbage collection, or a count that doesn't match.
-                if candidate.pages.len() != usize::from(header.count)
-                    || candidate.pages[slot].is_some()
-                {
+                if candidate.pages.len() != usize::from(header.count) {
                     stale.push(page);
-                    suspects.insert(ObjectId(header.object_id));
+                    suspects.insert(id);
+                    continue;
+                }
+                let last = slot + 1 == candidate.pages.len();
+                let commit = if last {
+                    commit_of(&bytes)
                 } else {
-                    candidate.pages[slot] = Some(page as u16);
+                    Commit::Erased
+                };
+                match candidate.pages[slot] {
+                    None => {
+                        candidate.pages[slot] = Some(page as u16);
+                        candidate.commit = candidate.commit.max(commit);
+                    }
+                    // A duplicate left by a cut garbage collection. Of a last page, the copy can
+                    // be the first one found, whole but with its commit byte not programmed yet.
+                    Some(kept) => {
+                        suspects.insert(id);
+                        if commit > candidate.commit {
+                            stale.push(usize::from(kept));
+                            candidate.pages[slot] = Some(page as u16);
+                            candidate.commit = commit;
+                        } else {
+                            stale.push(page);
+                        }
+                    }
                 }
             }
         }
@@ -98,12 +129,15 @@ impl<F: NorFlash> NorBackend<F> {
         for (id, candidates) in found {
             let current = candidates
                 .iter()
-                .filter(|c| c.pages.iter().all(Option::is_some))
+                .filter(|c| c.commit > Commit::Erased && c.pages.iter().all(Option::is_some))
                 .map(|c| c.version)
                 .max();
             for candidate in candidates {
                 let pages: Vec<u16> = candidate.pages.into_iter().flatten().collect();
                 if Some(candidate.version) == current {
+                    if candidate.commit == Commit::Partial {
+                        suspects.insert(id);
+                    }
                     for &page in &pages {
                         self.sectors[Self::sector_of(usize::from(page))].live += 1;
                     }
@@ -144,10 +178,10 @@ impl<F: NorFlash> NorBackend<F> {
         Ok(suspects)
     }
 
-    /// Writes the object `id` again, to new pages, as the power was cut while one of its pages
-    /// may have been written: the page can read right, with weak bits that flip later (see
-    /// `scan`). Does nothing if the object is gone, reads `Corrupt`, does not fit (`NoSpace`) or
-    /// can't be written (`VerifyFailed`): it keeps the pages it has.
+    /// Writes the object `id` again, to new pages, as a power cut may have left one of its pages
+    /// or its commit byte weak: it reads right, with bits that flip later (see `scan`). Does
+    /// nothing if the object is gone, reads `Corrupt`, does not fit (`NoSpace`) or can't be
+    /// written (`VerifyFailed`): it keeps the pages it has.
     pub(super) fn rewrite(&mut self, id: ObjectId) -> Result<(), NorError<F::Error>> {
         if !self.objects.contains_key(&id) {
             return Ok(());

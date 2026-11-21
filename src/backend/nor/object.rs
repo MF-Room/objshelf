@@ -65,18 +65,19 @@ impl<F: NorFlash> NorBackend<F> {
                 count: header_count,
                 len: chunk.len() as u16,
             };
-            match self.write_page(&header.encode(chunk)) {
+            // The commit, in the last page, once all the others read back right.
+            match self.write_page(&header.encode(chunk), index + 1 == count) {
                 Ok(page) => pages.push(page as u16),
                 Err(error) => {
-                    // An incomplete version: the page that failed may be whole anyway, which
-                    // completes it if it was the last one.
+                    // An incomplete version: the page that failed may be whole anyway, with its
+                    // commit, which completes it if it was the last one.
                     self.unmarked.extend(pages);
                     return Err(error);
                 }
             }
         }
 
-        // Every page is on flash: the new version is complete, the old one can go.
+        // Every page is on flash and committed: the new version is complete, the old one can go.
         for &page in &pages {
             self.sectors[Self::sector_of(usize::from(page))].live += 1;
         }
