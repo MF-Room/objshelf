@@ -712,20 +712,81 @@ fn a_commit_byte_that_reads_back_wrong_moves_the_last_page() {
 }
 
 #[test]
-fn a_sector_header_that_reads_back_wrong_leaves_the_sector_unformatted() {
-    let mut flash = SmallFlash::new(4);
-    // The header page of sector 0.
-    flash.worn = vec![0];
-    let mut backend = mount(flash);
-    write(&mut backend, 1, &bytes(1, 100));
-    // Sector 0 counts its erase and stays unformatted: sector 1 is opened instead.
-    assert_eq!(backend.objects[&ObjectId(1)].pages, [5]);
-    assert_eq!(backend.erase_counts().collect::<Vec<_>>(), [1, 1, 0, 0]);
+fn a_sector_header_or_commit_that_reads_back_wrong_leaves_the_sector_unformatted() {
+    // A byte of the header of sector 0, then its commit byte.
+    for worn in [0, COMMIT_OFFSET] {
+        let mut flash = SmallFlash::new(4);
+        flash.worn = vec![worn];
+        let mut backend = mount(flash);
+        write(&mut backend, 1, &bytes(1, 100));
+        // Sector 0 counts its erase and stays unformatted: sector 1 is opened instead.
+        assert_eq!(backend.objects[&ObjectId(1)].pages, [5], "worn {worn}");
+        assert!(!backend.sectors[0].formatted);
+        assert_eq!(backend.erase_counts().collect::<Vec<_>>(), [1, 1, 0, 0]);
 
+        let mut backend = reboot(backend);
+        assert_eq!(read(&mut backend, 1), Some(bytes(1, 100)));
+        assert!(!backend.sectors[0].formatted, "worn {worn}");
+        // Sectors 2 and 3 have no header: they get the average count of the others, 1.
+        assert_eq!(backend.erase_counts().collect::<Vec<_>>(), [1, 1, 1, 1]);
+    }
+}
+
+#[test]
+fn a_sector_header_cut_before_its_commit_is_not_used_as_the_cut_left_it() {
+    let ops = updates();
+    let total = run(SmallFlash::new(3), &ops).0.ops;
+    let mut cuts = 0;
+    for at in 0..total {
+        // Only the first half of the cut write is done: of a 1-byte commit, nothing. The header
+        // before it is whole, as a header whose write the cut left with weak bits.
+        let (flash, _) = run(SmallFlash::new(3).cut_at(at, Cut::FirstHalf), &ops);
+        let Some(offset) = flash.cut_write.map(|offset| offset as usize) else {
+            // An erase.
+            continue;
+        };
+        if offset % 1024 != COMMIT_OFFSET {
+            // Not the commit of a sector header.
+            continue;
+        }
+        cuts += 1;
+        let sector = offset / 1024;
+        let left = flash.data[sector * 1024..][..PAGE_SIZE].to_vec();
+
+        // The sector is erased again before use, while the writes open every sector.
+        let mut backend = mount(SmallFlash::with_data(flash.data));
+        for round in 0..10 {
+            let used_as_left = backend.sectors[sector].formatted
+                && backend.flash.data[sector * 1024..][..PAGE_SIZE] == left[..];
+            assert!(
+                !used_as_left,
+                "cut at operation {at}, round {round}: sector {sector} is used as the cut left it"
+            );
+            write(&mut backend, 3, &bytes(round, 20));
+        }
+        assert_eq!(read(&mut backend, 3), Some(bytes(9, 20)));
+    }
+    // In the first open of a sector, and in garbage collections.
+    assert!(cuts > 3, "{cuts}");
+}
+
+#[test]
+fn a_sector_keeps_its_data_when_the_commit_of_its_header_decays() {
+    let mut backend = mount(SmallFlash::new(4));
+    write(&mut backend, 1, &bytes(1, 300));
+    assert_eq!(backend.objects[&ObjectId(1)].pages, [1, 2]);
+    let mut data = backend.flash.data;
+    // All 8 bits of the commit byte of sector 0 flipped back.
+    data[COMMIT_OFFSET] = 0xFF;
+
+    // Not erased while other writes open every sector.
+    let mut backend = mount(SmallFlash::with_data(data));
+    for round in 0..20 {
+        write(&mut backend, 2, &bytes(round, 100));
+    }
+    assert_eq!(read(&mut backend, 1), Some(bytes(1, 300)));
     let mut backend = reboot(backend);
-    assert_eq!(read(&mut backend, 1), Some(bytes(1, 100)));
-    // Sector 1 is the only one with a header: the others get its count.
-    assert_eq!(backend.erase_counts().collect::<Vec<_>>(), [1, 1, 1, 1]);
+    assert_eq!(read(&mut backend, 1), Some(bytes(1, 300)));
 }
 
 #[test]

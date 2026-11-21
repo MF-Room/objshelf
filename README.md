@@ -213,8 +213,8 @@ in [`src/memory`](src/memory/mod.rs).
 
 * Objects are serialized with postcard, their name and type tag first, and split in 256-byte pages
   (20-byte header, 234-byte payload, 1-byte commit, 1-byte obsolete marker). Page 0 of each sector holds a
-  sector header with the format version and the erase count. A sector of another format version makes mount
-  fail with `UnsupportedFormat`, instead of being erased as unformatted.
+  sector header with the format version, the erase count, a commit byte and a retired marker. A sector of
+  another format version makes mount fail with `UnsupportedFormat`, instead of being erased as unformatted.
 * RAM index: `ObjectId` → current version and page list (`hashbrown::HashMap`, needs a heap).
 * Each write gets a new global version. A version counts only once all its pages are on flash and its last
   page is committed, so a power cut leaves either the old or the new value. Replaced and removed pages are
@@ -224,6 +224,9 @@ in [`src/memory`](src/memory/mod.rs).
   pages were cut never counts, even if they read right. When the cut hit the commit byte, leaving it partly
   programmed, or a garbage collection copying a page, mount writes the object again. Left: a commit byte
   programmed whole but weak; all 8 bits have to flip back for the version to stop counting.
+* A sector header gets a commit byte the same way, and data only goes in once it is programmed. Mount erases
+  again, before use, a sector whose header is valid but not committed and that holds no data: a weak header
+  could fail its CRC later and take the sector's data with it.
 * Every byte is programmed once between erases, and only from `0xFF`: a mark retried after a flash error
   reads its byte first.
 * A flash error that is not a power cut fails the operation without changing what the backend reports: a
@@ -240,11 +243,13 @@ in [`src/memory`](src/memory/mod.rs).
   erase count of the others instead of 0, so it is not reused first again and again.
 * Each page, commit byte and sector header is read back right after its write, while the data is still in
   RAM. A page or commit byte that reads back wrong gets the page marked obsolete and written again on the
-  next free page; a sector header that reads back wrong leaves the sector unformatted, and another sector
-  is opened. After 3 tries the write fails with `VerifyFailed`, and the object keeps its previous value.
+  next free page; a sector header or its commit byte that reads back wrong leaves the sector unformatted,
+  and another sector is opened. After 3 tries the write fails with `VerifyFailed`, and the object keeps
+  its previous value.
 * Bit rot is detected, not corrected (littlefs has no error correction either): a page that decays after
   its write fails its CRC, so a read gives `Corrupt`. After a reboot, mount can't trust the page, so it
-  sees an incomplete version and drops the object, which then reads as missing.
+  sees an incomplete version and drops the object, which then reads as missing. A sector header that decays
+  takes its sector with it: mount skips the sector, and every object with a page in it reads as missing.
 * Mount reads the whole region and rebuilds the index (2 MiB at 25 MHz: about 0.7 s).
 
 ### Lifetime
@@ -335,9 +340,8 @@ Requirements, guarantees, time and space complexity: module documentation in
   the backend reports and a retry finishes it; no remount
 - [x] Commit byte: a version counts once its last page is committed, in a program of its own after all
   its pages read back right, so the weak bits of a cut write are never taken for data, first write
-  included
+  included. A sector header has one too: one cut before its commit gets the sector erased again
 - [ ] Edge cases:
-  - a corrupted sector header makes mount ignore the whole sector and its objects
   - skipped dirty pages, and pages that read back wrong, can eat into the GC reserve; GC refuses a
     victim whose live pages don't fit
   - peak RAM: `write` and `read` hold the whole serialized object, plus the page list

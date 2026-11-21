@@ -4,8 +4,8 @@
 //! of a sector holds the sector header, the other pages hold object data.
 //!
 //! Every byte is programmed at most once between two erases, and only from `0xFF`: the bytes set
-//! after a page is written (the commit of a version, the obsolete and retired markers) are at the
-//! end of the page, which the first write leaves erased.
+//! after a page is written (the commits of a version and of a sector header, the obsolete and
+//! retired markers) are at the end of the page, which the first write leaves erased.
 
 use crate::backend::crc32;
 
@@ -15,8 +15,8 @@ pub(super) const PAGE_SIZE: usize = 256;
 /// Offset of the marker byte, `0xFF` until the page is obsolete or the sector retired.
 pub(super) const MARKER_OFFSET: usize = PAGE_SIZE - 1;
 
-/// Offset of the commit byte in the last page of a version: programmed to `COMMITTED` once all
-/// the pages of the version read back right, in a program of its own.
+/// Offset of the commit byte, programmed to `COMMITTED` in a program of its own: in the last page
+/// of a version once all its pages read back right, in a sector header once the header does.
 pub(super) const COMMIT_OFFSET: usize = MARKER_OFFSET - 1;
 
 pub(super) const COMMITTED: u8 = 0x00;
@@ -111,6 +111,7 @@ impl PageHeader {
 /// 2       2     version      FORMAT_VERSION when written by this code
 /// 4       4     erase_count
 /// 8       4     crc          CRC32 of bytes 0..8
+/// 254     1     commit       COMMITTED once the header reads back right
 /// 255     1     retired      0xFF until the sector is about to be erased
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,12 +119,15 @@ pub(super) struct SectorHeader {
     /// Version of the on-flash format of the sector.
     pub(super) version: u16,
     pub(super) erase_count: u32,
+    /// The commit byte is not erased: the header was written whole, even if the cut hit the
+    /// commit.
+    pub(super) committed: bool,
     /// Set before the sector is erased: if the erase is cut, the sector is erased again.
     pub(super) retired: bool,
 }
 
 impl SectorHeader {
-    /// Bytes to program right after the erase.
+    /// Bytes to program right after the erase, then read back before the commit.
     pub(super) fn encode(erase_count: u32) -> [u8; SECTOR_HEADER_SIZE] {
         let mut bytes = [0; SECTOR_HEADER_SIZE];
         bytes[0..2].copy_from_slice(&SECTOR_MAGIC.to_le_bytes());
@@ -143,6 +147,7 @@ impl SectorHeader {
         Some(Self {
             version: le16(page, 2),
             erase_count: le32(page, 4),
+            committed: commit_of(page) != Commit::Erased,
             retired: page[MARKER_OFFSET] != 0xFF,
         })
     }
@@ -152,7 +157,7 @@ pub(super) fn is_obsolete(page: &[u8; PAGE_SIZE]) -> bool {
     page[MARKER_OFFSET] != 0xFF
 }
 
-/// State of the commit byte of a page, which only the last page of a version programs.
+/// State of the commit byte of a page: a sector header, or the last page of a version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Commit {
     /// Erased: the version is not committed.
@@ -223,10 +228,16 @@ mod tests {
         let header = SectorHeader {
             version: FORMAT_VERSION,
             erase_count: 5,
+            committed: false,
             retired: false,
         };
         assert_eq!(SectorHeader::decode(&page), Some(header));
 
+        // The commit and the retired marker are outside the CRC. A partial commit counts.
+        page[COMMIT_OFFSET] = 0x0F;
+        assert!(SectorHeader::decode(&page).unwrap().committed);
+        page[COMMIT_OFFSET] = COMMITTED;
+        assert!(SectorHeader::decode(&page).unwrap().committed);
         page[MARKER_OFFSET] = 0;
         assert!(SectorHeader::decode(&page).unwrap().retired);
         assert_eq!(SectorHeader::decode(&[0xFF; PAGE_SIZE]), None);

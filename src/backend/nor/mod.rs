@@ -53,10 +53,15 @@
 //!   partly programmed, or a garbage collection copying a page, mount writes the object again.
 //!   Left: a commit byte that the cut left programmed but weak; all 8 bits have to flip back for
 //!   the version to stop counting.
+//! - A sector header has a commit byte too, programmed once the header reads back right, and data
+//!   only goes in after it. A sector whose header is valid but not committed, and holds no data,
+//!   is erased again before use: a weak header could fail its CRC later and take the sector's
+//!   data with it.
 //! - Every page, commit byte and sector header is read back right after its write, while the data
-//!   is still in RAM. A page or commit byte that reads back wrong gets the page marked obsolete
-//!   and written again on the next free page. A sector header that reads back wrong leaves its
-//!   sector unformatted, and the least worn free sector is picked again. After 3 tries, the write
+//!   is still in RAM. A page or its commit byte that reads back wrong gets the page marked
+//!   obsolete and written again on the next free page. A sector header or its commit byte that
+//!   reads back wrong leaves its sector unformatted, and the least worn free sector is picked
+//!   again. After 3 tries, the write
 //!   fails with [`NorError::VerifyFailed`].
 //! - Each sector header holds the version of the on-flash format: mount fails with
 //!   [`NorError::UnsupportedFormat`] on a sector of another version, instead of erasing it as
@@ -74,7 +79,7 @@
 //! | `write`, no GC | `k` blank-check reads, `k` page writes, `k` read-backs, a 1-byte write and read-back (the commit), `k'` 1-byte reads and writes | `O(len + S)` |
 //! | `remove` | `k'` 1-byte reads and writes | `O(k')` |
 //! | `usage` | none | `O(S)` |
-//! | GC, per sector reclaimed | up to `3 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 2 small writes, 2 small reads | `O(S + P)` |
+//! | GC, per sector reclaimed | up to `3 × (P - 1)` page reads, `P - 1` page writes, 1 erase, 3 small writes, 3 small reads | `O(S + P)` |
 //!
 //! A page or commit byte that reads back wrong costs one more page: a blank check, a write, a
 //! read-back and a 1-byte read and write, plus the commit again for a last page. A mark reads its
@@ -85,7 +90,8 @@
 //! When the wear gets uneven, it also moves one sector of data that never changes: the cost of
 //! reclaiming a sector, once more. Opening a sector without a header also erases it, even if it
 //! reads blank: an erase cut by a power loss can leave cells that read `0xFF` but are not fully
-//! erased, and nothing tells them apart from a sector never used. So on a fresh chip, the first
+//! erased, and nothing tells them apart from a sector never used. So does opening a sector whose
+//! header is not committed. So on a fresh chip, the first
 //! writes erase each sector once, and mount reads only page 0 of each sector.
 //!
 //! On the W25Q16JV at 25 MHz: page read ≈ 0.1 ms, page write 0.4 ms (3 ms max), sector erase
@@ -141,8 +147,8 @@ const RESERVED_SECTORS: usize = 1;
 /// spreads the wear more evenly, at the cost of more moves.
 const WEAR_GAP: u32 = 100;
 
-/// Pages tried for one page of data, and sectors for one sector header, when they read back wrong
-/// after their write, before giving up with [`NorError::VerifyFailed`].
+/// Pages tried for one page of data, and sectors for one sector header, when they or their commit
+/// byte read back wrong after their write, before giving up with [`NorError::VerifyFailed`].
 const WRITE_ATTEMPTS: usize = 3;
 
 /// Configuration of a [`NorBackend`].
@@ -172,8 +178,8 @@ pub enum NorError<E> {
     /// firmware: the mount fails without erasing anything.
     UnsupportedFormat(u16),
     /// A page of data, or its commit byte, read back wrong right after its write on 3 pages in a
-    /// row, or a sector header in 3 sectors: the flash is probably worn out. Nothing was replaced:
-    /// the object keeps its previous value.
+    /// row, or a sector header or its commit byte in 3 sectors: the flash is probably worn out.
+    /// Nothing was replaced: the object keeps its previous value.
     VerifyFailed,
 }
 
@@ -185,7 +191,8 @@ struct Object {
 
 #[derive(Debug, Clone, Copy)]
 struct Sector {
-    /// Erased with a valid header. Other sectors are erased before use.
+    /// Erased with a valid header, committed or followed by data. Other sectors are erased before
+    /// use.
     formatted: bool,
     erase_count: u32,
     /// Next page to allocate. Page 0 holds the sector header.

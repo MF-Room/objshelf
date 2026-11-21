@@ -1,5 +1,6 @@
 //! Mount: rebuilds the RAM state from flash, then writes again the objects that a power cut
-//! may have left with a weak page or commit byte.
+//! may have left with a weak page or commit byte. A sector whose header a power cut may have
+//! left weak is erased again before use.
 
 use alloc::collections::BTreeSet;
 use alloc::vec;
@@ -36,6 +37,11 @@ impl<F: NorFlash> NorBackend<F> {
     ///
     /// An object with any other stale page is written again too: an uncommitted version can be
     /// the rewrite of an earlier mount, cut before its commit.
+    ///
+    /// A sector header has a commit byte too, programmed once the header reads back right, and
+    /// data only goes in after it. A valid header without its commit, in a sector without data,
+    /// may be weak: the sector is erased again before use. A sector with data was committed when
+    /// the data went in, so its header is whole, even if the commit byte has decayed since.
     pub(super) fn scan(&mut self) -> Result<BTreeSet<ObjectId>, NorError<F::Error>> {
         let mut found: HashMap<ObjectId, Vec<Candidate>> = HashMap::new();
         let mut stale = Vec::new();
@@ -61,7 +67,6 @@ impl<F: NorFlash> NorBackend<F> {
             if header.retired {
                 continue;
             }
-            self.sectors[sector].formatted = true;
 
             for index in 1..Self::PAGES_PER_SECTOR {
                 let page = sector * Self::PAGES_PER_SECTOR + index;
@@ -124,6 +129,8 @@ impl<F: NorFlash> NorBackend<F> {
                     }
                 }
             }
+            let has_data = self.sectors[sector].next_page > 1;
+            self.sectors[sector].formatted = header.committed || has_data;
         }
 
         for (id, candidates) in found {

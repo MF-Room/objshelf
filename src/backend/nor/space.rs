@@ -34,8 +34,11 @@ impl<F: NorFlash> NorBackend<F> {
         }
     }
 
-    /// Erases a sector and writes its header, then reads the header back. Returns `false` if it
-    /// reads back wrong: the sector stays free and unformatted, to be erased again before use.
+    /// Erases a sector and writes its header, then reads the header back. The commit byte of the
+    /// header follows, in a program of its own, and is read back too: a header write cut by a
+    /// power loss can leave weak bits, which read right and flip later, after data went in.
+    /// Returns `false` if the header or its commit reads back wrong: the sector stays free and
+    /// unformatted, to be erased again before use.
     pub(super) fn erase_sector(&mut self, sector: usize) -> Result<bool, NorError<F::Error>> {
         // Once erased, the pages are reused: a page marked then would be another one.
         debug_assert!(
@@ -53,13 +56,14 @@ impl<F: NorFlash> NorBackend<F> {
         self.flash
             .erase(addr, addr + F::ERASE_SIZE as u32)
             .map_err(NorError::Flash)?;
-        let formatted = self.program_checked(addr, &SectorHeader::encode(erase_count))?;
+        let formatted = self.program_checked(addr, &SectorHeader::encode(erase_count))?
+            && self.program_checked(addr + COMMIT_OFFSET as u32, &[COMMITTED])?;
         self.sectors[sector].formatted = formatted;
         Ok(formatted)
     }
 
-    /// Makes the least worn free sector the active one. If its header reads back wrong, the least
-    /// worn free sector is picked again: the failed one now counts one more erase.
+    /// Makes the least worn free sector the active one. If its header or its commit reads back
+    /// wrong, the least worn free sector is picked again: the failed one now counts one more erase.
     fn open_sector(&mut self) -> Result<usize, NorError<F::Error>> {
         for _ in 0..WRITE_ATTEMPTS {
             let sector = (0..self.sectors.len())
@@ -74,7 +78,7 @@ impl<F: NorFlash> NorBackend<F> {
     }
 
     /// Makes `sector`, a free one, the active sector, erasing it first if it is not formatted.
-    /// Returns `false` if its header reads back wrong.
+    /// Returns `false` if its header or its commit reads back wrong.
     pub(super) fn activate(&mut self, sector: usize) -> Result<bool, NorError<F::Error>> {
         if !self.sectors[sector].formatted && !self.erase_sector(sector)? {
             return Ok(false);
