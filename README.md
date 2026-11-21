@@ -351,8 +351,6 @@ Requirements, guarantees, time and space complexity: module documentation in
   sectors kept for it (one that runs out of pages collects garbage and starts again), a move goes on in
   the second free sector, a static wear leveling move that still runs out stops without failing the
   write, and collections that free nothing end the write with `NoSpace` instead of looping
-- [ ] Edge cases:
-  - peak RAM: `write` and `read` hold the whole serialized object, plus the page list
 - [ ] Examples: one with RTIC, and one on std
 - [x] Implement `ObjShelf` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names
   stored with the objects, LRU read cache with a RAM budget, changes kept in RAM until a flush
