@@ -36,6 +36,11 @@ impl<F: NorFlash> NorBackend<F> {
             .map_or(0, |s| Self::PAGES_PER_SECTOR - self.sectors[s].next_page)
     }
 
+    /// Free pages, those of the sectors kept for garbage collection included.
+    fn free_pages(&self) -> usize {
+        self.active_free_pages() + self.free_sectors() * Self::DATA_PAGES
+    }
+
     /// Pages a write can use while keeping `RESERVED_SECTORS` free.
     pub(super) fn user_free_pages(&self) -> usize {
         match self.free_sectors().checked_sub(RESERVED_SECTORS) {
@@ -148,10 +153,32 @@ impl<F: NorFlash> NorBackend<F> {
         }
     }
 
+    /// Collects garbage until a write can use `pages` pages. The first collection also levels the
+    /// wear (see `level_wear`), the next ones don't: a move that stopped leaves garbage in the
+    /// sector it went to, which the next collection reclaims, and leveling again would go there
+    /// again, as it is then the most worn free sector.
+    ///
+    /// Fails with `NoSpace` when no sector can be collected, or after `WRITE_ATTEMPTS`
+    /// collections in a row that free no page: the pages that read back wrong while they moved
+    /// the live ones took all they freed, so the live pages would go round the sectors forever.
     pub(super) fn ensure_space(&mut self, pages: usize) -> Result<(), NorError<F::Error>> {
+        let mut level = true;
+        let (mut most_free, mut stalled) = (self.free_pages(), 0);
         while self.user_free_pages() < pages {
             if !self.collect()? {
                 return Err(NorError::NoSpace);
+            }
+            if self.free_pages() > most_free {
+                (most_free, stalled) = (self.free_pages(), 0);
+            } else {
+                stalled += 1;
+                if stalled == WRITE_ATTEMPTS {
+                    return Err(NorError::NoSpace);
+                }
+            }
+            if level {
+                level = false;
+                self.level_wear()?;
             }
         }
         Ok(())

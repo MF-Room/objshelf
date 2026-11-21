@@ -63,7 +63,7 @@ struct Local {
 #[init]
 fn init(cx: init::Context) -> (Shared, Local) {
     let flash = Flash::new(/* SPI bus, chip select, ... */);
-    // Region of the flash used by objshelf: aligned to the erase size, at least 2 sectors.
+    // Region of the flash used by objshelf: aligned to the erase size, at least 3 sectors.
     let config = NorConfig { flash, range: 0..64 * 4096 };
     // Blocks while the flash is mounted. Objects in RAM take about 16 KiB. The closure runs when
     // unflushed changes fill that budget: here it starts the `save` task.
@@ -196,7 +196,7 @@ stays in RAM for the next flush.
   type tag, in the free space of the backend: at most 65535 pages of 234 bytes (about 15 MiB) on NOR. An
   object that doesn't fit fails its flush with `NoSpace`, and the flush goes on with the others. A read or
   write also holds the whole serialized object on the heap while it runs. The NOR region is aligned to the
-  erase size, has at least 2 sectors (one stays free for garbage collection) and at most 16 MiB, and is
+  erase size, has at least 3 sectors (two stay free for garbage collection) and at most 16 MiB, and is
   used by nothing else. Each write of an object gets the next number of a `u32` counter, and mount keeps
   the copy with the highest one. The flash wears out before that counter can wrap: each write programs at
   least one page, and a W25Q16JV takes about 768 million page writes in its life (512 sectors × 15 data
@@ -234,20 +234,24 @@ in [`src/memory`](src/memory/mod.rs).
   ahead of the flash: a removal marks a page of the object obsolete before it forgets the object, and pages
   whose obsolete mark fails are kept in a list and marked before the next write or removal. After a reboot,
   the failed operation may be done or not, as after a power cut.
-* Garbage collection relocates the live pages of the sector with the most garbage and erases it; one free
-  sector is kept for it, which writes never take. Ties go to the least worn sector.
+* Garbage collection relocates the live pages of the sector with the most garbage and erases it; two free
+  sectors are kept for it, which writes never take. Ties go to the least worn sector. A move needs at most
+  one sector, so when pages that read back wrong in the first free sector make it need more room, it goes
+  on in the second one.
 * Wear: new pages go to the least worn free sector. Data that never changes would keep its sector out
   of the rotation, so when the least worn sector holding data is 100 erases behind the most worn one,
   garbage collection moves its data to the most worn free sector and erases it (static wear
-  leveling). A sector found without a header at mount (an erase cut by a power loss) gets the average
-  erase count of the others instead of 0, so it is not reused first again and again.
+  leveling). That move is optional: if it runs out of pages anyway, it stops and the write goes on. A
+  sector found without a header at mount (an erase cut by a power loss) gets the average erase count of
+  the others instead of 0, so it is not reused first again and again.
 * Each page, commit byte and sector header is read back right after its write, while the data is still in
   RAM. A page or commit byte that reads back wrong gets the page marked obsolete and written again on the
   next free page; a sector header or its commit byte that reads back wrong leaves the sector unformatted,
   and another sector is opened. After 3 tries the write fails with `VerifyFailed`, and the object keeps
   its previous value. Pages that read back wrong can make a write need more pages than it counted: rather
-  than take the free sector kept for garbage collection, it gives up its pages, collects garbage and starts
-  again (`NoSpace` after 3 tries).
+  than take the free sectors kept for garbage collection, it gives up its pages, collects garbage and
+  starts again (`NoSpace` after 3 tries). A write whose collections free no page 3 times in a row, as
+  pages that read back wrong took all they freed, fails with `NoSpace` too, instead of looping.
 * Bit rot is detected, not corrected (littlefs has no error correction either): a page that decays after
   its write fails its CRC, so a read gives `Corrupt`. After a reboot, mount can't trust the page, so it
   sees an incomplete version and drops the object, which then reads as missing. A sector header that decays
@@ -343,12 +347,11 @@ Requirements, guarantees, time and space complexity: module documentation in
 - [x] Commit byte: a version counts once its last page is committed, in a program of its own after all
   its pages read back right, so the weak bits of a cut write are never taken for data, first write
   included. A sector header has one too: one cut before its commit gets the sector erased again
-- [x] Writes never take the free sector kept for garbage collection: one that runs out of pages, as pages
-  that read back wrong took more than it counted, collects garbage and starts again
+- [x] Pages that read back wrong never run garbage collection out of room: writes never take the 2 free
+  sectors kept for it (one that runs out of pages collects garbage and starts again), a move goes on in
+  the second free sector, a static wear leveling move that still runs out stops without failing the
+  write, and collections that free nothing end the write with `NoSpace` instead of looping
 - [ ] Edge cases:
-  - a static wear leveling move has no garbage to spare: a page that reads back wrong in the free sector
-    it moves to runs it out, and the write fails with `NoSpace` (a retry works). A garbage collection
-    move can run out the same way, with 2 such pages or more
   - peak RAM: `write` and `read` hold the whole serialized object, plus the page list
 - [ ] Examples: one with RTIC, and one on std
 - [x] Implement `ObjShelf` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names

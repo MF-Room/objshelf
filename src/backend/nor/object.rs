@@ -44,7 +44,7 @@ impl<F: NorFlash> NorBackend<F> {
     /// Writes `data`, the object `id` serialized with its name, as its new version, then releases
     /// the old one. On an error, the object keeps its old version.
     ///
-    /// The write never takes the free sector kept for garbage collection. Pages that read back
+    /// The write never takes the free sectors kept for garbage collection. Pages that read back
     /// wrong can make it need more pages than `ensure_space` counted, so it can run out: it then
     /// gives up the pages it wrote, collects garbage and starts again, up to `WRITE_ATTEMPTS`
     /// times.

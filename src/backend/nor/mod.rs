@@ -27,7 +27,7 @@
 //!   `READ_SIZE == 1`, `ERASE_SIZE` a multiple of 256 and at least 512. `MultiwriteNorFlash` is not
 //!   needed: every byte is programmed at most once between erases, and only from `0xFF`. Chips with
 //!   internal ECC (`WRITE_SIZE > 1`) are not supported.
-//! - **Region**: aligned to `ERASE_SIZE`, at least 2 sectors (one is kept free for garbage
+//! - **Region**: aligned to `ERASE_SIZE`, at least 3 sectors (two are kept free for garbage
 //!   collection), at most 65536 pages (16 MiB), used by nothing else: a sector without an
 //!   objshelf header is erased when it is needed.
 //! - **Blocking**: each flash operation runs to completion when the driver is called, and so does
@@ -62,13 +62,17 @@
 //!   obsolete and written again on the next free page. A sector header or its commit byte that
 //!   reads back wrong leaves its sector unformatted, and the least worn free sector is picked
 //!   again. After 3 tries, the write fails with [`NorError::VerifyFailed`].
-//! - A write never takes the free sector kept for garbage collection, so garbage collection always
-//!   has a whole sector to move the live pages of its victim to. Pages that read back wrong can make a write
-//!   need more pages than it counted: when it runs out, it gives up the pages it wrote, collects
-//!   garbage and starts again. After 3 tries, it fails with [`NorError::NoSpace`]. Left: a move
-//!   whose free sector has pages that read back wrong can run out too, as a static wear leveling
-//!   move, which has no garbage to spare. The write then fails with [`NorError::NoSpace`], and a
-//!   retry collects the sector the move left half done.
+//! - A write never takes the 2 free sectors kept for garbage collection. A garbage collection
+//!   moves at most one sector of live pages, so when pages that read back wrong in the first free
+//!   sector make it need more room, it goes on in the second one. Pages that read back wrong can
+//!   also make a write need more pages than it counted: when it runs out, it gives up the pages it
+//!   wrote, collects garbage and starts again. After 3 tries, it fails with
+//!   [`NorError::NoSpace`]. So does a write whose collections free no page 3 times in a row: the
+//!   pages that read back wrong took all they freed, and more collections would move the same
+//!   live pages round the sectors forever.
+//! - A static wear leveling move is optional and tried once per write at most: if it runs out of
+//!   pages anyway, or they keep reading back wrong, it stops and the write goes on. The sector it
+//!   left half moved is collected later.
 //! - Each sector header holds the version of the on-flash format: mount fails with
 //!   [`NorError::UnsupportedFormat`] on a sector of another version, instead of erasing it as
 //!   unformatted.
@@ -94,12 +98,12 @@
 //! Hash map operations are expected `O(1)`.
 //!
 //! Garbage collection only runs inside a `write` that lacks space, possibly for several sectors.
-//! When the wear gets uneven, it also moves one sector of data that never changes: the cost of
-//! reclaiming a sector, once more. Opening a sector without a header also erases it, even if it
-//! reads blank: an erase cut by a power loss can leave cells that read `0xFF` but are not fully
-//! erased, and nothing tells them apart from a sector never used. So does opening a sector whose
-//! header is not committed. So on a fresh chip, the first
-//! writes erase each sector once, and mount reads only page 0 of each sector.
+//! When the wear gets uneven, its first collection also moves one sector of data that never
+//! changes: the cost of reclaiming a sector, once more. Opening a sector without a header also
+//! erases it, even if it reads blank: an erase cut by a power loss can leave cells that read
+//! `0xFF` but are not fully erased, and nothing tells them apart from a sector never used. So
+//! does opening a sector whose header is not committed. So on a fresh chip, the first writes
+//! erase each sector once, and mount reads only page 0 of each sector.
 //!
 //! On the W25Q16JV at 25 MHz: page read ≈ 0.1 ms, page write 0.4 ms (3 ms max), sector erase
 //! 45 ms (400 ms max), mount of 2 MiB ≈ 0.7 s of SPI reads. The read-back adds about 25% to a
@@ -116,9 +120,9 @@
 //! - `read` and `write`: the whole serialized object, plus a 256 B page buffer on the stack;
 //! - `mount`, temporarily: 4 B per page found, 8 B per sector.
 //!
-//! Flash: 234 payload bytes per 256-byte page, page 0 of each sector for its header, one sector
+//! Flash: 234 payload bytes per 256-byte page, page 0 of each sector for its header, two sectors
 //! kept free, at least one page per object. On a whole W25Q16JV (512 sectors) that is at most
-//! 511 × 15 × 234 B ≈ 1.71 MiB of live data. An update also needs room for its new version before
+//! 510 × 15 × 234 B ≈ 1.71 MiB of live data. An update also needs room for its new version before
 //! the old one is released. An object, serialized with its name and type tag, takes at most 65535
 //! pages (about 15 MiB) and must fit in the free space: `write` returns [`NorError::NoSpace`]
 //! otherwise.
@@ -147,8 +151,9 @@ use crate::ObjectId;
 use layout::{MARKER_OFFSET, PAGE_SIZE, PAYLOAD_SIZE};
 
 /// Free sectors kept so garbage collection always has room to relocate live pages: writes never
-/// take them.
-const RESERVED_SECTORS: usize = 1;
+/// take them. One holds the live pages of any sector; the second takes the pages that the first
+/// can't, as some of its pages read back wrong.
+const RESERVED_SECTORS: usize = 2;
 
 /// Static wear leveling: when the least worn sector holding data is this many erases behind the
 /// most worn sector, garbage collection moves its data to the most worn free sector. A lower gap
@@ -157,14 +162,15 @@ const WEAR_GAP: u32 = 100;
 
 /// Pages tried for one page of data, and sectors for one sector header, when they or their commit
 /// byte read back wrong after their write, before giving up with [`NorError::VerifyFailed`]. Also
-/// the tries of a write that runs out of pages, before giving up with [`NorError::NoSpace`].
+/// the tries of a write that runs out of pages, and the collections in a row that free no page,
+/// before giving up with [`NorError::NoSpace`].
 const WRITE_ATTEMPTS: usize = 3;
 
 /// Configuration of a [`NorBackend`].
 pub struct NorConfig<F> {
     /// Flash driver.
     pub flash: F,
-    /// Flash region used by the backend: aligned to `F::ERASE_SIZE`, at least 2 sectors.
+    /// Flash region used by the backend: aligned to `F::ERASE_SIZE`, at least 3 sectors.
     pub range: Range<u32>,
 }
 
@@ -177,7 +183,8 @@ pub enum NorError<E> {
     InvalidConfig,
     /// No object with this id.
     NotFound,
-    /// Not enough free space, even after garbage collection.
+    /// Not enough free space, even after garbage collection: pages that read back wrong take
+    /// space too.
     NoSpace,
     /// A page of the object failed its checks.
     Corrupt,

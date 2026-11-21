@@ -12,8 +12,8 @@ use super::{NorBackend, NorError, WEAR_GAP};
 use crate::ObjectId;
 
 impl<F: NorFlash> NorBackend<F> {
-    /// Reclaims the sector with the most garbage, the least worn one on a tie, then levels the
-    /// wear (see `level_wear`). Returns `false` if no sector can be reclaimed.
+    /// Reclaims the sector with the most garbage, the least worn one on a tie. Returns `false` if
+    /// no sector can be reclaimed.
     pub(super) fn collect(&mut self) -> Result<bool, NorError<F::Error>> {
         let Some(victim) = (0..self.sectors.len())
             .filter(|&s| self.sectors[s].formatted && self.garbage(s) > 0)
@@ -33,7 +33,6 @@ impl<F: NorFlash> NorBackend<F> {
             self.active = None;
         }
         self.reclaim(victim)?;
-        self.level_wear()?;
         Ok(true)
     }
 
@@ -45,7 +44,11 @@ impl<F: NorFlash> NorBackend<F> {
     ///
     /// Free space doesn't change: the data takes one free sector and frees another. Only sectors
     /// with a header count: one without may have worn out, its header failing to write.
-    fn level_wear(&mut self) -> Result<(), NorError<F::Error>> {
+    ///
+    /// The move is optional: if it runs out of pages, or they keep reading back wrong, it stops
+    /// without an error. The pages moved so far stay where they went, and the sector left half
+    /// moved, with garbage now, is collected later.
+    pub(super) fn level_wear(&mut self) -> Result<(), NorError<F::Error>> {
         let most_worn = (self.sectors.iter())
             .filter(|s| s.formatted)
             .map(|s| s.erase_count)
@@ -86,7 +89,11 @@ impl<F: NorFlash> NorBackend<F> {
             }
             self.active = Some(previous);
         }
-        moved
+        match moved {
+            // The first copies of the moved pages, in `unmarked`, are marked before any erase.
+            Err(NorError::NoSpace | NorError::VerifyFailed) => self.mark_unmarked(),
+            moved => moved,
+        }
     }
 
     /// Moves the live pages of `sector` to the active sector, then erases it.

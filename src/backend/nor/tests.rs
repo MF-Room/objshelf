@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -9,7 +10,7 @@ use super::layout::{
     COMMIT_OFFSET, COMMITTED, FORMAT_VERSION, PAGE_SIZE, PAYLOAD_SIZE, PageHeader,
 };
 use super::mock::{Cut, Done, MockError, MockFlash};
-use super::{NorBackend, NorConfig, NorError, WEAR_GAP};
+use super::{NorBackend, NorConfig, NorError, RESERVED_SECTORS, WEAR_GAP};
 use crate::ObjectId;
 use crate::backend::{Backend, Usage, Wear, type_tag};
 
@@ -150,9 +151,9 @@ fn garbage_collection_reuses_space() {
 
 #[test]
 fn usage() {
-    // 4 sectors of 3 data pages, one kept for garbage collection.
+    // 5 sectors of 3 data pages, two kept for garbage collection.
     let page = PAYLOAD_SIZE;
-    let mut backend = mount(SmallFlash::new(4));
+    let mut backend = mount(SmallFlash::new(5));
     let empty = Usage {
         capacity: 9 * page,
         used: 0,
@@ -199,12 +200,12 @@ fn usage_adds_up_while_collecting() {
 
 #[test]
 fn full_then_space_again() {
-    let mut backend = mount(SmallFlash::new(3));
+    let mut backend = mount(SmallFlash::new(4));
     let mut stored = 0;
     while backend.write(ObjectId(stored), "", &bytes(0, 50)).is_ok() {
         stored += 1;
     }
-    // 3 sectors of 3 data pages, one sector kept for garbage collection.
+    // 4 sectors of 3 data pages, two sectors kept for garbage collection.
     assert_eq!(stored, 6);
     assert!(matches!(
         backend.write(ObjectId(99), "", &0u8),
@@ -323,7 +324,7 @@ fn stored(backend: &mut NorBackend<SmallFlash>) -> BTreeMap<u32, Vec<u8>> {
 #[test]
 fn power_cut_at_every_operation() {
     let ops = ops();
-    let (flash, failed) = run(SmallFlash::new(3), &ops);
+    let (flash, failed) = run(SmallFlash::new(4), &ops);
     assert_eq!(failed, None);
     let total = flash.ops;
     let mut expected = BTreeMap::new();
@@ -335,7 +336,7 @@ fn power_cut_at_every_operation() {
 
     for cut in [Cut::FirstHalf, Cut::SecondHalf] {
         for at in 0..total {
-            let (flash, failed) = run(SmallFlash::new(3).cut_at(at, cut), &ops);
+            let (flash, failed) = run(SmallFlash::new(4).cut_at(at, cut), &ops);
             // None if the cut hit the marks of the old version in the last op: the new version
             // is whole, so the op succeeds.
             let failed = failed.unwrap_or(ops.len());
@@ -398,7 +399,7 @@ fn either(state: &State, ops: &[&Op]) -> Vec<State> {
 /// after each op. As `ObjShelf` does, an op that fails is retried after the next op, or before it
 /// if both are on the same object. Returns the errors.
 fn run_with_errors(ops: &[Op], fail: &[(usize, Done)]) -> usize {
-    let flash = (fail.iter()).fold(SmallFlash::new(4), |flash, &(at, done)| {
+    let flash = (fail.iter()).fold(SmallFlash::new(5), |flash, &(at, done)| {
         flash.fail_at(at, done)
     });
     let mut backend = mount(flash);
@@ -528,7 +529,7 @@ const DONE: [Done; 4] = [
 #[test]
 fn a_flash_error_at_every_operation_changes_nothing_and_is_retried() {
     let ops = mixed_ops();
-    let total = run(SmallFlash::new(4), &ops).0.ops;
+    let total = run(SmallFlash::new(5), &ops).0.ops;
     let mut errors = 0;
     for done in DONE {
         for at in 0..total {
@@ -557,7 +558,7 @@ fn a_flash_error_around_a_garbage_collection_and_a_removal() {
     let remove = Op::Remove(1);
     // A failed collection, then the removal of the object it moved; a failed removal, then the
     // collection of its sector.
-    let (flash, _) = run(SmallFlash::new(4), &setup);
+    let (flash, _) = run(SmallFlash::new(5), &setup);
     let setup_ops = flash.ops;
     let mut moved = mount(SmallFlash::with_data(flash.data));
     collect.apply_to(&mut moved).unwrap();
@@ -565,7 +566,7 @@ fn a_flash_error_around_a_garbage_collection_and_a_removal() {
 
     for last in [[&collect, &remove], [&remove, &collect]] {
         let ops: Vec<Op> = setup.iter().chain(last).cloned().collect();
-        let total = run(SmallFlash::new(4), &ops).0.ops;
+        let total = run(SmallFlash::new(5), &ops).0.ops;
         for done in DONE {
             for at in setup_ops..total {
                 run_with_errors(&ops, &[(at, done)]);
@@ -585,7 +586,7 @@ fn two_flash_errors_at_every_pair_of_operations() {
         Op::Write(1, bytes(1, 20)),
         Op::Remove(3),
     ];
-    let total = run(SmallFlash::new(4), &ops).0.ops;
+    let total = run(SmallFlash::new(5), &ops).0.ops;
     for first in 0..total {
         // The error shifts the later operations by one at most.
         for second in first + 1..=total {
@@ -613,14 +614,14 @@ fn updates() -> Vec<Op> {
 #[test]
 fn a_page_cut_in_any_write_is_not_live_as_the_cut_left_it() {
     let ops = updates();
-    let first_update = run(SmallFlash::new(3), &ops[..3]).0.ops;
-    let total = run(SmallFlash::new(3), &ops).0.ops;
+    let first_update = run(SmallFlash::new(4), &ops[..3]).0.ops;
+    let total = run(SmallFlash::new(4), &ops).0.ops;
     // Pages left whole by a cut in a first write, and in an update or a relocation.
     let (mut weak_first, mut weak_later) = (0, 0);
     for at in 0..total {
         // Only the first half of the cut write is done. When that holds the header and payload,
         // the page reads whole, as a page whose write the cut left with weak bits.
-        let (flash, _) = run(SmallFlash::new(3).cut_at(at, Cut::FirstHalf), &ops);
+        let (flash, _) = run(SmallFlash::new(4).cut_at(at, Cut::FirstHalf), &ops);
         let Some(offset) = flash.cut_write else {
             // An erase.
             continue;
@@ -676,7 +677,7 @@ fn a_commit_byte_cut_half_programmed_gets_the_object_written_again() {
 
 #[test]
 fn a_clean_mount_writes_nothing() {
-    let (flash, _) = run(SmallFlash::new(3), &updates());
+    let (flash, _) = run(SmallFlash::new(4), &updates());
     assert_eq!(mount(SmallFlash::with_data(flash.data)).flash.ops, 0);
 }
 
@@ -735,12 +736,12 @@ fn a_sector_header_or_commit_that_reads_back_wrong_leaves_the_sector_unformatted
 #[test]
 fn a_sector_header_cut_before_its_commit_is_not_used_as_the_cut_left_it() {
     let ops = updates();
-    let total = run(SmallFlash::new(3), &ops).0.ops;
+    let total = run(SmallFlash::new(4), &ops).0.ops;
     let mut cuts = 0;
     for at in 0..total {
         // Only the first half of the cut write is done: of a 1-byte commit, nothing. The header
         // before it is whole, as a header whose write the cut left with weak bits.
-        let (flash, _) = run(SmallFlash::new(3).cut_at(at, Cut::FirstHalf), &ops);
+        let (flash, _) = run(SmallFlash::new(4).cut_at(at, Cut::FirstHalf), &ops);
         let Some(offset) = flash.cut_write.map(|offset| offset as usize) else {
             // An erase.
             continue;
@@ -790,18 +791,18 @@ fn a_sector_keeps_its_data_when_the_commit_of_its_header_decays() {
 }
 
 #[test]
-fn a_write_never_takes_the_free_sector_kept_for_garbage_collection() {
-    let mut backend = mount(SmallFlash::new(4));
+fn a_write_never_takes_the_free_sectors_kept_for_garbage_collection() {
+    let mut backend = mount(SmallFlash::new(5));
     for id in 1..=6 {
         write(&mut backend, id, &bytes(id as u8, 100));
     }
     write(&mut backend, 1, &bytes(11, 100));
     write(&mut backend, 2, &bytes(12, 100));
     // Sector 0 holds 2 pages of garbage. The write fits in the last page of sector 2, the
-    // active one, and sector 3 is the only free sector.
+    // active one, and only sectors 3 and 4, kept for garbage collection, are free.
     assert_eq!(backend.active, Some(2));
     assert_eq!(backend.active_free_pages(), 1);
-    assert_eq!(backend.free_sectors(), 1);
+    assert_eq!(backend.free_sectors(), 2);
     assert_eq!(backend.garbage(0), 2);
 
     // That page reads back wrong. The write does not go on in sector 3: it collects sector 0,
@@ -809,12 +810,42 @@ fn a_write_never_takes_the_free_sector_kept_for_garbage_collection() {
     backend.flash_mut().worn = vec![11 * PAGE_SIZE];
     write(&mut backend, 3, &bytes(13, 100));
     assert_eq!(backend.objects[&ObjectId(3)].pages, [14]);
-    assert_eq!(backend.free_sectors(), 1);
-    assert!(backend.is_free(0));
+    assert_eq!(backend.free_sectors(), 2);
+    assert!(backend.is_free(0) && backend.is_free(4));
 
     let mut backend = reboot(backend);
     let expected = [11, 12, 13, 4, 5, 6];
     for (id, seed) in (1..=6).zip(expected) {
+        assert_eq!(read(&mut backend, id), Some(bytes(seed, 100)));
+    }
+}
+
+#[test]
+fn a_collection_goes_on_in_the_second_free_sector() {
+    let mut backend = mount(SmallFlash::new(5));
+    for id in 1..=8 {
+        write(&mut backend, id, &bytes(id as u8, 100));
+    }
+    write(&mut backend, 1, &bytes(11, 100));
+    // Sector 0 holds 1 page of garbage and 2 live ones. Sector 2, the active one, is full, and
+    // only sectors 3 and 4, kept for garbage collection, are free.
+    assert_eq!(backend.garbage(0), 1);
+    assert_eq!(backend.active_free_pages(), 0);
+    assert!(backend.is_free(3) && backend.is_free(4));
+
+    // The next write collects sector 0. Its 2 live pages go to sector 3, where 2 pages read back
+    // wrong: the first one takes its last page, the second one goes on in sector 4.
+    backend.flash_mut().worn = vec![13 * PAGE_SIZE, 14 * PAGE_SIZE];
+    write(&mut backend, 2, &bytes(12, 100));
+    assert_eq!(backend.objects[&ObjectId(3)].pages, [17]);
+    // Sector 0 is then the only free sector: a second collection reclaims sector 3, whose live
+    // page goes to sector 4 too, before the write.
+    assert!(backend.is_free(0) && backend.is_free(3));
+    assert_eq!(backend.objects[&ObjectId(2)].pages, [19]);
+
+    let mut backend = reboot(backend);
+    let expected = [11, 12, 3, 4, 5, 6, 7, 8];
+    for (id, seed) in (1..=8).zip(expected) {
         assert_eq!(read(&mut backend, id), Some(bytes(seed, 100)));
     }
 }
@@ -918,6 +949,94 @@ fn data_that_never_changes_still_moves_to_level_the_wear() {
     assert_eq!(read(&mut backend, 9), Some(bytes(9, 600)));
     assert_eq!(read(&mut backend, 1), Some(bytes(2998u32 as u8, 100)));
     assert_eq!(read(&mut backend, 2), Some(bytes(2999u32 as u8, 100)));
+}
+
+/// The flash of `with_static_object` after the writes of `hot` before the first one that moves
+/// object 9 out of sector 0, and the round of that write.
+fn before_first_static_move() -> (NorBackend<SmallFlash>, u32) {
+    let first_move = {
+        let mut backend = with_static_object();
+        (0..)
+            .find(|&round| {
+                hot(round).apply_to(&mut backend).unwrap();
+                backend.objects[&ObjectId(9)].pages != [1, 2, 3]
+            })
+            .unwrap()
+    };
+    let mut backend = with_static_object();
+    for round in 0..first_move {
+        hot(round).apply_to(&mut backend).unwrap();
+    }
+    (backend, first_move)
+}
+
+/// Write `round` of `hot`, with the data pages `bad` reading back wrong during it. Panics if it
+/// loops.
+fn hot_with_bad_pages(
+    backend: &mut NorBackend<SmallFlash>,
+    round: u32,
+    bad: &[usize],
+) -> Result<(), NorError<MockError>> {
+    let flash = backend.flash_mut();
+    flash.worn = bad.iter().map(|page| page * PAGE_SIZE).collect();
+    let mut programs = 0;
+    flash.on_write = Some(Box::new(move || {
+        programs += 1;
+        assert!(programs < 10_000, "the write loops");
+    }));
+    let result = hot(round).apply_to(backend);
+    let flash = backend.flash_mut();
+    flash.worn.clear();
+    flash.on_write = None;
+    result
+}
+
+#[test]
+fn a_static_wear_leveling_move_that_runs_out_stops_and_the_write_goes_on() {
+    // Object 9 moves to sector 1, the most worn free sector.
+    let (mut backend, round) = before_first_static_move();
+    hot_with_bad_pages(&mut backend, round, &[]).unwrap();
+    assert_eq!(backend.objects[&ObjectId(9)].pages, [5, 6, 7]);
+
+    // Every page of sector 1 reads back wrong: the move stops at its first page, the write goes
+    // on. Collecting sector 1 then makes it the most worn free sector again: the move is not
+    // tried again in that write.
+    let (mut backend, round) = before_first_static_move();
+    hot_with_bad_pages(&mut backend, round, &[5, 6, 7]).unwrap();
+    assert_eq!(backend.objects[&ObjectId(9)].pages, [1, 2, 3]);
+
+    // A later write moves it.
+    for round in round + 1..round + 50 {
+        hot(round).apply_to(&mut backend).unwrap();
+    }
+    assert_ne!(backend.objects[&ObjectId(9)].pages, [1, 2, 3]);
+    let mut backend = reboot(backend);
+    assert_eq!(read(&mut backend, 9), Some(bytes(9, 600)));
+    assert_eq!(stored(&mut backend), {
+        let mut expected = State::new();
+        (round + 48..round + 50).for_each(|round| apply(&mut expected, &hot(round)));
+        expected
+    });
+}
+
+#[test]
+fn collections_that_free_nothing_end_the_write_with_no_space() {
+    // The first page of sectors 1, 2 and 3 reads back wrong: each collection moves 2 live pages
+    // to the next free sector, where they take its last 2 pages. It frees nothing, and the next
+    // collection does the same, from that sector.
+    let (mut backend, round) = before_first_static_move();
+    let before = stored(&mut backend);
+    let result = hot_with_bad_pages(&mut backend, round, &[5, 9, 13]);
+    assert!(matches!(result, Err(NorError::NoSpace)), "{result:?}");
+
+    assert_eq!(stored(&mut backend), before);
+    assert_eq!(read(&mut backend, 9), Some(bytes(9, 600)));
+    hot(round).apply_to(&mut backend).unwrap();
+    let mut backend = reboot(backend);
+    let mut expected = before;
+    apply(&mut expected, &hot(round));
+    assert_eq!(stored(&mut backend), expected);
+    assert_eq!(read(&mut backend, 9), Some(bytes(9, 600)));
 }
 
 #[test]
@@ -1028,7 +1147,7 @@ fn a_worn_out_flash_fails_writes_and_keeps_the_data() {
 #[ignore]
 fn pages_per_erase() {
     let sectors = 64;
-    let capacity = (sectors - 1) * 15;
+    let capacity = (sectors - RESERVED_SECTORS) * 15;
     for percent in [10, 25, 50, 75, 90] {
         let mut backend = mount(MockFlash::<4096>::new(sectors));
         let objects = (capacity * percent / 100) as u32;
