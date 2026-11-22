@@ -162,10 +162,15 @@ impl<F: NorFlash> NorBackend<F> {
 
         // A sector without a header lost its erase count to a cut erase, or was never formatted.
         // At 0, it would pass for the least worn sector and be opened again and again until its
-        // count caught up: it gets the average count instead.
-        if let Some(average) = erase_sum.checked_div(headers) {
-            for sector in headerless {
-                self.sectors[sector].erase_count = average as u32;
+        // count caught up: it gets the average count instead. That is an estimate, which `wear`
+        // leaves out: counted, the average given to every sector never formatted would add up to
+        // erases that never happened.
+        let average = erase_sum.checked_div(headers);
+        for sector in headerless {
+            let sector = &mut self.sectors[sector];
+            sector.estimated = true;
+            if let Some(average) = average {
+                sector.erase_count = average as u32;
             }
         }
 

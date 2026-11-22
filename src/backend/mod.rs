@@ -147,6 +147,10 @@ pub struct Wear {
     pub most_worn: u32,
     /// Erases of all the sectors added up. The counts are stored with the sectors, so this keeps
     /// counting across reboots.
+    ///
+    /// A sector without a stored count is left out until its first erase: one never used (a
+    /// fresh chip), or one whose erase a power cut interrupted. In that second case, this drops by
+    /// about one sector's erases until that sector is erased again.
     pub total_erases: u64,
 }
 

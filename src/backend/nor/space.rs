@@ -62,9 +62,11 @@ impl<F: NorFlash> NorBackend<F> {
         );
         let addr = self.sector_addr(sector);
         let erase_count = self.sectors[sector].erase_count.saturating_add(1);
+        // The count now includes an erase done, and goes in the header.
         self.sectors[sector] = Sector {
             formatted: false,
             erase_count,
+            estimated: false,
             next_page: 1,
             live: 0,
         };

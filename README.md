@@ -123,6 +123,35 @@ No function waits, so any task can call any of them. When a call can't be done n
 and does nothing: try again later. Tasks that don't share `mem` are never blocked by objshelf, whatever their
 priority.
 
+The whole app, which builds, is in [Examples](#examples).
+
+## Examples
+
+Both run the same app. It keeps three objects across restarts: a boot count, settings written each time they
+change, and samples written with the other changes every 5 rounds. It runs 20 rounds of 250 ms, then prints
+the objects, `usage` and `wear`.
+
+- [`examples/rtic_nor`](examples/rtic_nor): RTIC 2 on the MSeq board, an STM32F413 with a W25Q16JV on SPI2 at
+  25 MHz (CS on PB12; SCK, MISO and MOSI on PB13 to PB15; the FRAM's CS, PB10, stays high). It is a crate of
+  its own, with a small blocking W25Q16JV `NorFlash` driver (`src/w25q16jv.rs`). With a debug probe:
+
+  ```sh
+  cd examples/rtic_nor
+  cargo run --release
+  ```
+
+  probe-rs flashes it and prints its RTT output. Its region, the first 256 KiB of the W25Q16JV, is erased:
+  what it held is lost.
+- [`examples/std_fs.rs`](examples/std_fs.rs): the same app on std, with the file system backend. Threads stand
+  in for the tasks, and a `std::sync::Mutex` for the RTIC lock, through a small `objshelf::Mutex` impl.
+
+  ```sh
+  cargo run --example std_fs --features fs [dir]
+  ```
+
+  The objects stay in `dir`, by default `objshelf-std-fs` in the temporary directory: run it again and the
+  boot count goes up.
+
 ## API
 
 In a task, `mem` is `&mut cx.shared.mem`. In `init`, before the memory is shared, it is `&mut mem` on the
@@ -242,8 +271,10 @@ in [`src/memory`](src/memory/mod.rs).
   of the rotation, so when the least worn sector holding data is 100 erases behind the most worn one,
   garbage collection moves its data to the most worn free sector and erases it (static wear
   leveling). That move is optional: if it runs out of pages anyway, it stops and the write goes on. A
-  sector found without a header at mount (an erase cut by a power loss) gets the average erase count of
-  the others instead of 0, so it is not reused first again and again.
+  sector found without a header at mount (an erase cut by a power loss, or never formatted) gets the
+  average erase count of the others instead of 0, so it is not reused first again and again. `wear`
+  leaves that estimate out until the sector is erased, so a fresh chip doesn't report erases that never
+  happened.
 * Each page, commit byte and sector header is read back right after its write, while the data is still in
   RAM. A page or commit byte that reads back wrong gets the page marked obsolete and written again on the
   next free page; a sector header or its commit byte that reads back wrong leaves the sector unformatted,
@@ -327,48 +358,3 @@ let mut mem = ObjShelf::<FsBackend>::mount(config, 1 << 20, || {})?;
 
 Requirements, guarantees, time and space complexity: module documentation in
 [`src/backend/fs/mod.rs`](src/backend/fs/mod.rs) (`cargo doc --features fs --document-private-items`).
-
-## TODO
-
-- [x] Reuse a store crate (`sequential-storage`, `ekv`, `littlefs2`) or write one: own store
-- [x] When to run garbage collection: only a flush writes, so it only runs inside a flush, in the
-  lowest-priority task. Its erases (up to 400 ms per sector) never block a higher-priority task: objects in
-  RAM keep working, and the others return `None` until the flush ends.
-- [x] Wear leveling: the least worn free sector is opened next, ties between GC victims go to the least
-  worn sector, static wear leveling in the GC (data that never changes moves once its sector is 100
-  erases behind), and a sector header lost to an interrupted erase gets the average erase count
-- [x] Lifetime estimate: the formula and measured pages per erase (Lifetime), `wear(mem)` at
-  runtime, and an end-of-life test on a simulated flash that wears out
-- [x] Read back each page and sector header after its write, and write it again elsewhere if it reads
-  back wrong (`VerifyFailed` after 3 tries)
-- [x] Format version in the sector header: mount fails on another version instead of erasing it
-- [x] Flash errors: the RAM index never gets ahead of the flash, so a failed operation changes nothing
-  the backend reports and a retry finishes it; no remount
-- [x] Commit byte: a version counts once its last page is committed, in a program of its own after all
-  its pages read back right, so the weak bits of a cut write are never taken for data, first write
-  included. A sector header has one too: one cut before its commit gets the sector erased again
-- [x] Pages that read back wrong never run garbage collection out of room: writes never take the 2 free
-  sectors kept for it (one that runs out of pages collects garbage and starts again), a move goes on in
-  the second free sector, a static wear leveling move that still runs out stops without failing the
-  write, and collections that free nothing end the write with `NoSpace` instead of looping
-- [ ] Examples: one with RTIC, and one on std
-- [x] Implement `ObjShelf` (`src/api.rs`, `src/memory`): RTIC shared resource with short locks, names
-  stored with the objects, LRU read cache with a RAM budget, changes kept in RAM until a flush
-- [x] RAM accounting: an object counts its heap with `get-size2`, spare capacity included, instead of a
-  serialized-size estimate
-- [x] `Error::TooBig` from `with_mut` and `insert` for an object bigger than the whole RAM budget, instead
-  of `None` forever
-- [x] A flush writes the other objects and does the removals when one object fails to write (for example
-  with `NoSpace`), and returns the first error at the end, so one failing object does not block every
-  write
-- [x] Names stored with the objects instead of in a directory object, which was a single point of
-  failure (lost, mount removed every object) and was rewritten whole on every `insert` or `remove`
-- [x] Type check on read: each object is stored with a 4-byte hash of its type's name, checked before
-  decoding, so a wrong type gives `WrongType` instead of a postcard error or a wrong decode. Changes to a
-  type's fields are not detected: firmware updates are up to the app
-- [x] Max name length: `MAX_NAME_LEN`, 64 bytes, `NameTooLong` from `insert`
-- [x] Max object size and flash region used by objshelf: documented (Limits)
-- [x] Host tests with a simulated `NorFlash` (power cuts, flash errors, worn pages, wear-out, two
-  geometries), `cargo test` in CI
-- [x] File system backend (feature `fs`): one file per object, replaced by a rename, `O_DIRECT` with a
-  buffered fallback, a quota, a lock against a second mount

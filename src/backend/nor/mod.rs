@@ -16,9 +16,11 @@
 //!   most worn sector, garbage collection moves its data to the most worn free sector and erases
 //!   it. It is then the least worn free sector, so the next one opened. The erase counts of
 //!   sectors holding data stay within about `WEAR_GAP` of each other.
-//! - A sector found without a header at mount (an erase cut by a power loss) gets the average
-//!   erase count of the others.
-//! - [`Backend::wear`] reports the erase counts, for a lifetime estimate (README, Lifetime).
+//! - A sector found without a header at mount (an erase cut by a power loss, or never formatted)
+//!   gets the average erase count of the others.
+//! - [`Backend::wear`] reports the erase counts, for a lifetime estimate (README, Lifetime). It
+//!   leaves out those averages, until each of these sectors is erased: they are estimates, and
+//!   on a fresh chip they would add up to erases that never happened.
 //!
 //! # Requirements
 //!
@@ -211,6 +213,10 @@ struct Sector {
     /// use.
     formatted: bool,
     erase_count: u32,
+    /// `erase_count` is an estimate: the sector had no header at mount, so it got the average count
+    /// of the others (see `scan`). Its real count is unknown, so `wear` leaves it out until the
+    /// sector is erased again.
+    estimated: bool,
     /// Next page to allocate. Page 0 holds the sector header.
     next_page: usize,
     /// Pages holding the current version of an object.
@@ -251,7 +257,7 @@ impl<F: NorFlash> NorBackend<F> {
 
     /// Erase count of each sector of the region, in address order. A sector found without a header
     /// at mount (an erase cut by a power loss, or never formatted) gets the average count of the
-    /// sectors with one.
+    /// sectors with one, which [`Backend::wear`] leaves out.
     pub fn erase_counts(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
         self.sectors.iter().map(|s| s.erase_count)
     }
@@ -343,6 +349,7 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
         let unformatted = Sector {
             formatted: false,
             erase_count: 0,
+            estimated: false,
             next_page: 1,
             live: 0,
         };
@@ -427,9 +434,12 @@ impl<F: NorFlash + 'static> Backend for NorBackend<F> {
         self.objects.keys().copied().collect()
     }
 
-    /// From the erase counts of the sectors (see `erase_counts`).
+    /// From the erase counts of the sectors (see `erase_counts`), without those of the sectors
+    /// found without a header at mount and not erased since: they only hold an estimate.
     fn wear(&self) -> Option<Wear> {
-        let counts = self.sectors.iter().map(|s| s.erase_count);
+        let counts = (self.sectors.iter())
+            .filter(|s| !s.estimated)
+            .map(|s| s.erase_count);
         Some(Wear {
             sectors: self.sectors.len() as u32,
             most_worn: counts.clone().max().unwrap_or(0),

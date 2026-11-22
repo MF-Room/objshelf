@@ -69,7 +69,7 @@ pub(crate) struct MockFlash<const ERASE_SIZE: usize> {
     /// rated endurance. `None`: it never wears out.
     pub(super) erase_limit: Option<u32>,
     /// Erases of each sector so far.
-    erases: Vec<u32>,
+    pub(super) erases: Vec<u32>,
     /// Gets a copy of the data when the power is cut (see `copy_on_cut`).
     left: Option<Arc<Mutex<Vec<u8>>>>,
 }

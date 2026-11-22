@@ -892,6 +892,36 @@ fn worn_pages_lose_nothing() {
 }
 
 #[test]
+fn the_wear_leaves_out_the_estimated_counts_of_sectors_without_a_header() {
+    // 3 data pages per sector: 4 writes of a page format 2 of the 8 sectors, the others stay blank.
+    let mut backend = mount(SmallFlash::new(8));
+    for round in 0..4u32 {
+        write(&mut backend, round % 2, &bytes(round as u8, 100));
+    }
+    let mut backend = mount(backend.into_flash().rebooted());
+    let done = backend.flash.erases.clone();
+    assert_eq!(done, [1, 1, 0, 0, 0, 0, 0, 0]);
+    // The blank sectors get the average count, for wear leveling, but the wear only counts the
+    // erases done.
+    assert_eq!(backend.erase_counts().collect::<Vec<_>>(), [1; 8]);
+    let wear = Wear {
+        sectors: 8,
+        most_worn: 1,
+        total_erases: 2,
+    };
+    assert_eq!(backend.wear(), Some(wear));
+
+    // Once erased, a sector counts again, from its estimate.
+    for round in 4..100u32 {
+        write(&mut backend, round % 2, &bytes(round as u8, 100));
+    }
+    assert!(backend.flash.erases.iter().all(|&erases| erases > 0));
+    let counts: Vec<u32> = backend.erase_counts().collect();
+    let total = counts.iter().map(|&count| u64::from(count)).sum();
+    assert_eq!(backend.wear().unwrap().total_erases, total);
+}
+
+#[test]
 fn a_sector_without_a_header_gets_the_average_erase_count() {
     let mut backend = mount(SmallFlash::new(4));
     for round in 0..300u32 {

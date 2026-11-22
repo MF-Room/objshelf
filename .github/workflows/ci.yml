@@ -28,3 +28,25 @@ jobs:
         name: test (host)
       - run: cargo test --features fs
         name: test (fs)
+      - run: cargo run --example std_fs --features fs
+        name: example (std, fs)
+
+  rtic-example:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/rtic_nor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/rtic_nor
+      - run: cargo fmt --check
+      - run: cargo clippy --release -- -D warnings
+        name: clippy
+      - run: cargo build --release
+        name: build

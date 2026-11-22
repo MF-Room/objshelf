@@ -39,6 +39,9 @@ use crate::{Error, Handle, Storable};
 /// objshelf::flush(&mut cx.shared.mem)?; // the changes go to the backend
 /// ```
 ///
+/// A whole app is in the repository: `examples/rtic_nor` with RTIC on an STM32F413 and SPI NOR,
+/// and `examples/std_fs.rs`, the same app with threads and the file system backend.
+///
 /// # Writes
 ///
 /// Only [`flush`], [`flush_object`] (which writes one object) and [`unmount`](Self::unmount) write

@@ -1,0 +1,29 @@
+[package]
+name = "objshelf-example-rtic-nor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "objshelf on the MSeq board: RTIC 2 on an STM32F413, the NOR backend on its W25Q16JV."
+
+[dependencies]
+objshelf = { path = "../.." }
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.5"
+cortex-m-semihosting = "0.5.0"
+embedded-alloc = "0.6.0"
+embedded-hal = "1.0.0"
+embedded-hal-bus = "0.3.0"
+embedded-storage = "0.3.1"
+get-size2 = { version = "0.11.1", default-features = false, features = ["alloc", "derive"] }
+panic-rtt-target = "0.2.0"
+rtic = { version = "2.2.0", features = ["thumbv7-backend"] }
+rtic-monotonics = { version = "2.1.0", features = ["cortex-m-systick"] }
+rtt-target = "0.6.1"
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive"] }
+stm32f4xx-hal = { version = "0.23.0", features = ["stm32f413"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
