@@ -129,7 +129,7 @@ The whole app, which builds, is in [Examples](#examples).
 
 Both run the same app. It keeps three objects across restarts: a boot count, settings written each time they
 change, and samples written with the other changes every 5 rounds. It runs 20 rounds of 250 ms, then prints
-the objects, `usage` and `wear`.
+the objects, `usage`, `wear` and the time each objshelf function took (calls, mean, longest).
 
 - [`examples/rtic_nor`](examples/rtic_nor): RTIC 2 on the MSeq board, an STM32F413 with a W25Q16JV on SPI2 at
   25 MHz (CS on PB12; SCK, MISO and MOSI on PB13 to PB15; the FRAM's CS, PB10, stays high). It is a crate of

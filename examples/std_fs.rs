@@ -7,12 +7,16 @@
 //!
 //! The objects are kept in `dir`, by default `objshelf-std-fs` in the temporary directory. Run it
 //! again: the boot count goes up, and the settings and samples carry over.
+//!
+//! At the end, it prints the time each objshelf function took: its calls, their mean and the
+//! longest. The flushes include the writes reaching the disk: the backend syncs each file.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use get_size2::GetSize;
 use objshelf::backend::fs::{FsBackend, FsConfig, FsError};
@@ -80,6 +84,47 @@ impl objshelf::Mutex for Shared<'_> {
     }
 }
 
+/// The calls to one objshelf function.
+#[derive(Default)]
+struct Time {
+    calls: u32,
+    total: Duration,
+    longest: Duration,
+}
+
+/// The calls to each objshelf function, by name, from both threads.
+static TIMES: Mutex<BTreeMap<&str, Time>> = Mutex::new(BTreeMap::new());
+
+/// Runs `call`, a call to the objshelf function `name`, and adds its time to `TIMES`. On the app
+/// thread, that includes waiting for the lock while the saver holds it, between two writes of a
+/// flush.
+fn timed<R>(name: &'static str, call: impl FnOnce() -> R) -> R {
+    let start = Instant::now();
+    let result = call();
+    let elapsed = start.elapsed();
+    let mut times = TIMES.lock().expect("no thread panics with the lock");
+    let time = times.entry(name).or_default();
+    time.calls += 1;
+    time.total += elapsed;
+    time.longest = time.longest.max(elapsed);
+    result
+}
+
+fn print_times() {
+    println!("time in objshelf:");
+    println!(
+        "  {:<18} {:>5} {:>10} {:>10}",
+        "function", "calls", "mean", "longest"
+    );
+    for (name, time) in TIMES.lock().expect("no thread panics with the lock").iter() {
+        let mean = time.total / time.calls;
+        println!(
+            "  {name:<18} {:>5} {mean:>10.1?} {:>10.1?}",
+            time.calls, time.longest,
+        );
+    }
+}
+
 fn main() -> Result<(), Error<FsError>> {
     let dir = std::env::args_os().nth(1).map_or_else(
         || std::env::temp_dir().join("objshelf-std-fs"),
@@ -95,25 +140,36 @@ fn main() -> Result<(), Error<FsError>> {
     SAVER.set(saver.clone()).ok();
     // Objects in RAM take about 16 KiB. The closure runs when unflushed changes fill that budget:
     // here it has the saver write them all.
-    let mut mem = Mem::mount(config, CACHE_BYTES, || {
-        if let Some(saver) = SAVER.get() {
-            saver.send(Save::All).ok();
-        }
+    let mut mem = timed("mount", || {
+        Mem::mount(config, CACHE_BYTES, || {
+            if let Some(saver) = SAVER.get() {
+                saver.send(Save::All).ok();
+            }
+        })
     })?;
 
     // Before the memory is shared, the functions take it directly, as in RTIC's `init`. Each object
     // is found after a restart, or created on the first one.
-    let boots = objshelf::get_or_insert_with(&mut mem, "boots", || 0u32)?.expect("fits");
-    let boot = objshelf::with_mut(&mut mem, &boots, |n| {
-        *n += 1;
-        *n
+    let boots = timed("get_or_insert_with", || {
+        objshelf::get_or_insert_with(&mut mem, "boots", || 0u32)
+    })?
+    .expect("fits");
+    let boot = timed("with_mut", || {
+        objshelf::with_mut(&mut mem, &boots, |n| {
+            *n += 1;
+            *n
+        })
     })?
     .expect("nothing else has the memory");
-    objshelf::flush_object(&mut mem, &boots)?;
+    timed("flush_object", || objshelf::flush_object(&mut mem, &boots))?;
     println!("boot {boot}");
-    let settings = objshelf::get_or_insert_with(&mut mem, "settings", Settings::default)?;
+    let settings = timed("get_or_insert_with", || {
+        objshelf::get_or_insert_with(&mut mem, "settings", Settings::default)
+    })?;
     let settings = settings.expect("fits");
-    let samples = objshelf::get_or_insert_with(&mut mem, "samples", Samples::default)?;
+    let samples = timed("get_or_insert_with", || {
+        objshelf::get_or_insert_with(&mut mem, "samples", Samples::default)
+    })?;
     let samples = samples.expect("fits");
 
     let mem = Mutex::new(mem);
@@ -126,9 +182,10 @@ fn main() -> Result<(), Error<FsError>> {
         done.and(saved)
     })?;
     // Flushes what is left, as RTIC's `report` does.
-    mem.into_inner()
-        .expect("no thread panics with the lock")
-        .unmount()
+    let mem = mem.into_inner().expect("no thread panics with the lock");
+    timed("unmount", || mem.unmount())?;
+    print_times();
+    Ok(())
 }
 
 /// The RTIC task `app`, of priority 2. Here the threads run side by side, where RTIC's `app`
@@ -143,9 +200,11 @@ fn app(
         thread::sleep(Duration::from_millis(PERIOD_MS.into()));
         // Reads the object from the backend if it is not in RAM. The change stays in RAM until
         // the saver writes it, straight away.
-        let brightness = objshelf::with_mut(&mut mem, &settings, |s| {
-            s.brightness = s.brightness.wrapping_add(1);
-            s.brightness
+        let brightness = timed("with_mut", || {
+            objshelf::with_mut(&mut mem, &settings, |s| {
+                s.brightness = s.brightness.wrapping_add(1);
+                s.brightness
+            })
         })?;
         match brightness {
             Some(brightness) => {
@@ -158,11 +217,13 @@ fn app(
         }
 
         let reading = read_sensor(round);
-        let added = objshelf::with_mut(&mut mem, &samples, |s| {
-            if s.0.len() == SAMPLES {
-                s.0.remove(0);
-            }
-            s.0.push(reading);
+        let added = timed("with_mut", || {
+            objshelf::with_mut(&mut mem, &samples, |s| {
+                if s.0.len() == SAMPLES {
+                    s.0.remove(0);
+                }
+                s.0.push(reading);
+            })
         })?;
         if added.is_none() {
             println!("round {round}: busy, sample {reading} dropped");
@@ -182,11 +243,13 @@ fn save(mut mem: Shared, work: Receiver<Save>) -> Result<(), Error<FsError>> {
     for job in work {
         match job {
             Save::All => {
-                objshelf::flush(&mut mem)?;
+                timed("flush", || objshelf::flush(&mut mem))?;
                 println!("saved all the changes");
             }
             Save::Settings(settings) => {
-                objshelf::flush_object(&mut mem, &settings)?;
+                timed("flush_object", || {
+                    objshelf::flush_object(&mut mem, &settings)
+                })?;
             }
             Save::Report(settings, samples) => return report(mem, settings, samples),
         }
@@ -200,22 +263,24 @@ fn report(
     settings: Handle<Settings>,
     samples: Handle<Samples>,
 ) -> Result<(), Error<FsError>> {
-    objshelf::flush(&mut mem)?;
-    let mut names = objshelf::list(&mut mem);
+    timed("flush", || objshelf::flush(&mut mem))?;
+    let mut names = timed("list", || objshelf::list(&mut mem));
     names.sort();
     println!("objects: {names:?}");
-    if let Some((name, brightness)) =
-        objshelf::with(&mut mem, &settings, |s| (s.name.clone(), s.brightness))?
-    {
+    let settings = timed("with", || {
+        objshelf::with(&mut mem, &settings, |s| (s.name.clone(), s.brightness))
+    })?;
+    if let Some((name, brightness)) = settings {
         println!("settings: {name:?}, brightness {brightness}");
     }
-    if let Some((count, last)) =
-        objshelf::with(&mut mem, &samples, |s| (s.0.len(), s.0.last().copied()))?
-    {
+    let samples = timed("with", || {
+        objshelf::with(&mut mem, &samples, |s| (s.0.len(), s.0.last().copied()))
+    })?;
+    if let Some((count, last)) = samples {
         println!("samples: {count}, last {last:?}");
     }
-    println!("usage: {:?}", objshelf::usage(&mut mem));
-    match objshelf::wear(&mut mem) {
+    println!("usage: {:?}", timed("usage", || objshelf::usage(&mut mem)));
+    match timed("wear", || objshelf::wear(&mut mem)) {
         Some(wear) => println!("wear: {wear:?}"),
         None => println!("wear: not tracked by this backend"),
     }

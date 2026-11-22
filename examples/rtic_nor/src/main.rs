@@ -3,6 +3,8 @@
 //!
 //! The app keeps three objects across reboots: a boot count, settings written each time they
 //! change, and samples written every few rounds. After 20 rounds, it prints a report and stops.
+//! The report ends with the time each objshelf function took: its calls, their mean and the
+//! longest, from the cycle counter.
 //!
 //! ```text
 //! cd examples/rtic_nor
@@ -19,13 +21,18 @@ extern crate alloc;
 
 mod w25q16jv;
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
+use core::time::Duration;
 
+use cortex_m::peripheral::DWT;
 use embedded_alloc::LlffHeap as Heap;
 use get_size2::GetSize;
 use panic_rtt_target as _;
+use rtic::Mutex;
+use rtt_target::rprintln;
 use serde::{Deserialize, Serialize};
 
 /// Rounds of the app, one per `PERIOD_MS`, before the report.
@@ -37,6 +44,9 @@ const SAVE_EVERY: u32 = 5;
 const SAMPLES: usize = 64;
 /// RAM budget of the objects.
 const CACHE_BYTES: usize = 16 * 1024;
+
+/// The core clock, which the cycle counter counts.
+const SYSCLK_HZ: u32 = 100_000_000;
 
 #[derive(Serialize, Deserialize, GetSize)]
 struct Settings {
@@ -62,6 +72,72 @@ fn read_sensor(round: u32) -> u16 {
     2000 + (round * 37 % 100) as u16
 }
 
+/// The calls to one objshelf function, in cycles of the core clock.
+#[derive(Default)]
+struct Time {
+    calls: u32,
+    total: u64,
+    longest: u32,
+}
+
+/// The calls to each objshelf function, by name, from all the tasks. Public: RTIC makes its
+/// resources public.
+#[derive(Default)]
+pub struct Times(BTreeMap<&'static str, Time>);
+
+/// With exclusive access, in `init`: locking is free.
+impl Mutex for Times {
+    type T = Self;
+
+    fn lock<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        f(self)
+    }
+}
+
+impl Times {
+    fn print(&self) {
+        rprintln!("time in objshelf:");
+        rprintln!(
+            "  {:<18} {:>5} {:>10} {:>10}",
+            "function",
+            "calls",
+            "mean",
+            "longest"
+        );
+        for (name, time) in &self.0 {
+            let mean = time.total / u64::from(time.calls);
+            let longest = time.longest.into();
+            rprintln!(
+                "  {:<18} {:>5} {:>10.1?} {:>10.1?}",
+                name,
+                time.calls,
+                duration(mean),
+                duration(longest),
+            );
+        }
+    }
+}
+
+fn duration(cycles: u64) -> Duration {
+    Duration::from_nanos(cycles * 1_000_000_000 / u64::from(SYSCLK_HZ))
+}
+
+/// Runs `call`, a call to the objshelf function `name`, and adds its time to `times`. In the tasks
+/// of priority 1, that includes the time `app` preempts them. The cycle counter wraps after 42 s,
+/// far more than a call takes.
+fn timed<R>(times: &mut impl Mutex<T = Times>, name: &'static str, call: impl FnOnce() -> R) -> R {
+    let start = DWT::cycle_count();
+    let result = call();
+    let cycles = DWT::cycle_count().wrapping_sub(start);
+    times.lock(|times| {
+        let time = times.0.entry(name).or_default();
+        time.calls += 1;
+        time.total += u64::from(cycles);
+        time.longest = time.longest.max(cycles);
+    });
+    result
+}
+
 /// The heap, for objshelf and the objects: twice the RAM budget, for the serialized objects of a
 /// flush and the rest.
 const HEAP_SIZE: usize = 32 * 1024;
@@ -83,7 +159,7 @@ mod app {
     use objshelf::backend::nor::{NorBackend, NorConfig};
     use objshelf::{Handle, ObjShelf};
     use rtic_monotonics::systick::prelude::*;
-    use rtt_target::{rprintln, rtt_init_print};
+    use rtt_target::{ChannelMode, rprintln, rtt_init_print};
     use stm32f4xx_hal::gpio::{AnyPin, Output, PinState, Speed};
     use stm32f4xx_hal::pac::SPI2;
     use stm32f4xx_hal::prelude::*;
@@ -92,8 +168,6 @@ mod app {
 
     use super::*;
     use crate::w25q16jv::W25q16jv;
-
-    const SYSCLK_HZ: u32 = 100_000_000;
 
     /// Part of the W25Q16JV used by objshelf: its first 64 sectors of 4 KiB. Erased when needed,
     /// so what it held is lost.
@@ -107,6 +181,7 @@ mod app {
     #[shared]
     struct Shared {
         mem: Mem,
+        times: Times,
     }
 
     #[local]
@@ -118,13 +193,19 @@ mod app {
 
     #[init]
     fn init(cx: init::Context) -> (Shared, Local) {
-        rtt_init_print!();
+        // Room for the whole report, printed at once.
+        rtt_init_print!(ChannelMode::NoBlockSkip, 4096);
         init_heap();
         let mut rcc = cx
             .device
             .RCC
             .freeze(Config::hse(25.MHz()).sysclk(SYSCLK_HZ.Hz()));
         Mono::start(cx.core.SYST, SYSCLK_HZ);
+        // The cycle counter, for the times of the objshelf functions.
+        let mut dcb = cx.core.DCB;
+        dcb.enable_trace();
+        let mut dwt = cx.core.DWT;
+        dwt.enable_cycle_counter();
 
         // SPI2 at 25 MHz (APB1 / 2), mode 0. The FRAM is on the same bus: its chip select stays
         // high.
@@ -150,48 +231,65 @@ mod app {
             flash,
             range: REGION,
         };
-        let mut mem = Mem::mount(config, CACHE_BYTES, || {
-            save::spawn().ok();
+        let mut times = Times::default();
+        let mut mem = timed(&mut times, "mount", || {
+            Mem::mount(config, CACHE_BYTES, || {
+                save::spawn().ok();
+            })
         })
         .unwrap();
 
         // Before `mem` is shared, the functions take it directly. Each object is found after a
         // reboot, or created on the first boot.
-        let boots = objshelf::get_or_insert_with(&mut mem, "boots", || 0u32)
-            .unwrap()
-            .expect("fits");
-        let boot = objshelf::with_mut(&mut mem, &boots, |n| {
-            *n += 1;
-            *n
+        let boots = timed(&mut times, "get_or_insert_with", || {
+            objshelf::get_or_insert_with(&mut mem, "boots", || 0u32)
+        })
+        .unwrap()
+        .expect("fits");
+        let boot = timed(&mut times, "with_mut", || {
+            objshelf::with_mut(&mut mem, &boots, |n| {
+                *n += 1;
+                *n
+            })
         })
         .unwrap()
         .expect("nothing else has the memory");
-        objshelf::flush_object(&mut mem, &boots).unwrap();
+        timed(&mut times, "flush_object", || {
+            objshelf::flush_object(&mut mem, &boots)
+        })
+        .unwrap();
         rprintln!("boot {}", boot);
-        let settings = objshelf::get_or_insert_with(&mut mem, "settings", Settings::default)
-            .unwrap()
-            .expect("fits");
-        let samples = objshelf::get_or_insert_with(&mut mem, "samples", Samples::default)
-            .unwrap()
-            .expect("fits");
+        let settings = timed(&mut times, "get_or_insert_with", || {
+            objshelf::get_or_insert_with(&mut mem, "settings", Settings::default)
+        })
+        .unwrap()
+        .expect("fits");
+        let samples = timed(&mut times, "get_or_insert_with", || {
+            objshelf::get_or_insert_with(&mut mem, "samples", Samples::default)
+        })
+        .unwrap()
+        .expect("fits");
 
         app::spawn().unwrap();
-        (Shared { mem }, Local { settings, samples })
+        (Shared { mem, times }, Local { settings, samples })
     }
 
     // Above the tasks that write: it keeps running during a flush, so it can find the storage
     // busy, and then gets `Ok(None)`.
-    #[task(priority = 2, shared = [mem], local = [settings, samples])]
+    #[task(priority = 2, shared = [mem, times], local = [settings, samples])]
     async fn app(mut cx: app::Context) {
         let (settings, samples) = (*cx.local.settings, *cx.local.samples);
         let mem = &mut cx.shared.mem;
+        let times = &mut cx.shared.times;
         for round in 1..=ROUNDS {
             Mono::delay(PERIOD_MS.millis()).await;
             // Reads the object from the backend if it is not in RAM. The change stays in RAM
             // until `save_settings` writes it, straight away.
-            let brightness = objshelf::with_mut(mem, &settings, |s| {
-                s.brightness = s.brightness.wrapping_add(1);
-                s.brightness
+            let brightness = timed(times, "with_mut", || {
+                objshelf::with_mut(mem, &settings, |s| {
+                    s.brightness = s.brightness.wrapping_add(1);
+                    s.brightness
+                })
             })
             .unwrap();
             match brightness {
@@ -208,11 +306,13 @@ mod app {
             }
 
             let reading = read_sensor(round);
-            let added = objshelf::with_mut(mem, &samples, |s| {
-                if s.0.len() == SAMPLES {
-                    s.0.remove(0);
-                }
-                s.0.push(reading);
+            let added = timed(times, "with_mut", || {
+                objshelf::with_mut(mem, &samples, |s| {
+                    if s.0.len() == SAMPLES {
+                        s.0.remove(0);
+                    }
+                    s.0.push(reading);
+                })
             })
             .unwrap();
             if added.is_none() {
@@ -230,39 +330,53 @@ mod app {
     // running meanwhile. With the same priority, none interrupts another, so none gets `None`.
 
     // Writes all the changes. Spawned by `on_full`: only a full flush frees the whole budget.
-    #[task(priority = 1, shared = [mem])]
+    #[task(priority = 1, shared = [mem, times])]
     async fn save(mut cx: save::Context) {
-        objshelf::flush(&mut cx.shared.mem).unwrap();
+        let mem = &mut cx.shared.mem;
+        timed(&mut cx.shared.times, "flush", || objshelf::flush(mem)).unwrap();
         rprintln!("saved all the changes");
     }
 
     // Writes only the settings: the other changes stay in RAM until `save` runs. A handle is
     // `Copy`, so it can be a spawn argument.
-    #[task(priority = 1, shared = [mem])]
+    #[task(priority = 1, shared = [mem, times])]
     async fn save_settings(mut cx: save_settings::Context, settings: Handle<Settings>) {
-        objshelf::flush_object(&mut cx.shared.mem, &settings).unwrap();
+        let mem = &mut cx.shared.mem;
+        timed(&mut cx.shared.times, "flush_object", || {
+            objshelf::flush_object(mem, &settings)
+        })
+        .unwrap();
     }
 
     // The state of the memory once the rounds are done, then a stop.
-    #[task(priority = 1, shared = [mem])]
+    #[task(priority = 1, shared = [mem, times])]
     async fn report(mut cx: report::Context, settings: Handle<Settings>, samples: Handle<Samples>) {
         let mem = &mut cx.shared.mem;
-        objshelf::flush(mem).unwrap();
-        let mut names = objshelf::list(mem);
+        let times = &mut cx.shared.times;
+        timed(times, "flush", || objshelf::flush(mem)).unwrap();
+        let mut names = timed(times, "list", || objshelf::list(mem));
         names.sort();
         rprintln!("objects: {:?}", names);
-        let settings = objshelf::with(mem, &settings, |s| (s.name.clone(), s.brightness));
+        let settings = timed(times, "with", || {
+            objshelf::with(mem, &settings, |s| (s.name.clone(), s.brightness))
+        });
         if let Some((name, brightness)) = settings.unwrap() {
             rprintln!("settings: {:?}, brightness {}", name, brightness);
         }
-        let samples = objshelf::with(mem, &samples, |s| (s.0.len(), s.0.last().copied()));
+        let samples = timed(times, "with", || {
+            objshelf::with(mem, &samples, |s| (s.0.len(), s.0.last().copied()))
+        });
         if let Some((count, last)) = samples.unwrap() {
             rprintln!("samples: {}, last {:?}", count, last);
         }
-        rprintln!("usage: {:?}", objshelf::usage(mem));
-        if let Some(wear) = objshelf::wear(mem) {
+        rprintln!(
+            "usage: {:?}",
+            timed(times, "usage", || objshelf::usage(mem))
+        );
+        if let Some(wear) = timed(times, "wear", || objshelf::wear(mem)) {
             rprintln!("wear: {:?}", wear);
         }
+        times.lock(|times| times.print());
         // A semihosting exit: `probe-rs run` ends with success. Without a debugger, it faults.
         cortex_m_semihosting::debug::exit(cortex_m_semihosting::debug::EXIT_SUCCESS);
     }
