@@ -189,7 +189,8 @@ the previous one. Both are release builds.
 
 ## License
 
-Copyright © 2026 MF Room.
+Licensed under the GNU Lesser General Public License, version 2.1 only (`LGPL-2.1-only`). See
+[LICENSE](LICENSE).
 
-Licensed under the GNU Lesser General Public License, version 2.1 only (SPDX-License-Identifier:
-`LGPL-2.1-only`). See [LICENSE](LICENSE) for the full text.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in objshelf by
+you shall be licensed as LGPL-2.1-only, without any additional terms or conditions.
