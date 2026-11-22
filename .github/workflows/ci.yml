@@ -28,6 +28,10 @@ jobs:
         name: test (host)
       - run: cargo test --features fs
         name: test (fs)
+      - run: cargo doc --no-deps --features fs
+        name: doc (as docs.rs)
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: cargo run --example std_fs --features fs
         name: example (std, fs)
 

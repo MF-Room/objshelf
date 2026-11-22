@@ -46,9 +46,10 @@ use crate::{Error, Handle, Storable};
 ///
 /// Only [`flush`], [`flush_object`] (which writes one object) and [`unmount`](Self::unmount) write
 /// to the backend. Changes, [`insert`] and [`remove`] included, stay in RAM until then. A flush
-/// runs in the caller's task: a few ms per object, and hundreds of ms when NOR garbage collection
-/// runs (a sector erase can take 400 ms on SPI NOR). Call it from a task of the lowest priority,
-/// so that every other task keeps running meanwhile.
+/// runs in the caller's task: about 3 ms per small object on SPI NOR and 15 ms on an SSD, where
+/// the file system backend syncs each file, and hundreds of ms when NOR garbage collection runs (a
+/// sector erase can take 400 ms on SPI NOR). Call it from a task of the lowest priority, so that
+/// every other task keeps running meanwhile.
 ///
 /// # Locking
 ///
@@ -58,8 +59,8 @@ use crate::{Error, Handle, Storable};
 ///
 /// - RAM work: names, changes, and the access to an object in RAM, with the closure given to
 ///   [`with`] or [`with_mut`] (keep closures short);
-/// - the read of an object that is not in RAM: about 85 µs per 256-byte page on SPI NOR at
-///   25 MHz.
+/// - the read of an object that is not in RAM: about 0.23 ms per 256-byte page on SPI NOR at
+///   25 MHz, with the driver of `examples/rtic_nor` (82 µs of it is the SPI transfer).
 ///
 /// The writes of a flush run outside of it. Meanwhile the storage is busy.
 ///
@@ -111,8 +112,8 @@ impl<B: Backend> ObjShelf<B> {
     /// (see [RAM budget](Self#ram-budget)). It runs inside the lock: keep it short, as spawning
     /// the task that flushes. `|| {}` does nothing.
     ///
-    /// Meant for RTIC's `init`. The NOR backend reads the whole region (about 0.7 s for 2 MiB of
-    /// SPI NOR at 25 MHz).
+    /// Meant for RTIC's `init`. The NOR backend reads the whole region (about 1.9 s for 2 MiB of
+    /// SPI NOR at 25 MHz, 0.23 ms a page with the driver of `examples/rtic_nor`).
     pub fn mount(
         config: B::Config,
         cache_bytes: usize,

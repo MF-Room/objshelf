@@ -1,5 +1,7 @@
 # objshelf
 
+[![crates.io](https://img.shields.io/crates/v/objshelf.svg)](https://crates.io/crates/objshelf)
+[![docs.rs](https://img.shields.io/docsrs/objshelf)](https://docs.rs/objshelf)
 [![CI](https://github.com/MF-Room/objshelf/actions/workflows/ci.yml/badge.svg)](https://github.com/MF-Room/objshelf/actions/workflows/ci.yml)
 [![License: LGPL v2.1](https://img.shields.io/badge/License-LGPL_v2.1-blue.svg)](LICENSE)
 

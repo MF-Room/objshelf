@@ -1,3 +1,26 @@
+//! A portable object store that caches plain Rust values on the heap, over pluggable backends
+//! from bare-metal to hosted systems.
+//!
+//! Objects have a name and a type. They are read from the backend on first use and kept in RAM
+//! within a budget. Changes stay in RAM until you flush them, so the writes to storage only happen
+//! when and where you choose. No function waits: a call that can't be done now returns `Ok(None)`.
+//!
+//! - [`ObjShelf`]: mounting, the RAM budget, locking, durability, and an example.
+//! - Objects: [`list`], [`get`], [`insert`], [`get_or_insert_with`], [`remove`], [`with`] and
+//!   [`with_mut`].
+//! - Writes: [`flush`] and [`flush_object`]. Storage: [`usage`] and [`wear`].
+//! - Backends: [`backend::nor`], NOR flash through any blocking `NorFlash` driver, and
+//!   `backend::fs`, a directory of files (feature `fs`).
+//!
+//! # Features
+//!
+//! - `fs`: the file system backend, for Unix. It needs `std`. Without it the crate is `no_std`
+//!   and only needs `alloc`.
+//!
+//! The [repository](https://github.com/MF-Room/objshelf) has the README, with timings and a
+//! lifetime estimate for NOR flash, and two examples of a whole app: `examples/rtic_nor`, RTIC 2
+//! on an STM32F413 with SPI NOR, and `examples/std_fs.rs`, the same app on std.
+
 #![cfg_attr(not(any(test, feature = "fs")), no_std)]
 
 extern crate alloc;

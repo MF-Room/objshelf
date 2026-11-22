@@ -6,6 +6,8 @@ authors = ["Julien Eudine <julien@eudine.fr>", "Marius Debussche <marius.debussc
 description = "A portable object store that caches plain Rust values on the heap, over pluggable backends from bare-metal to hosted systems."
 license = "LGPL-2.1-only"
 repository = "https://github.com/MF-Room/objshelf"
+categories = ["embedded", "no-std", "database-implementations", "caching"]
+keywords = ["nor-flash", "storage", "persistence", "wear-leveling", "rtic"]
 
 [dependencies]
 crc = "3.4.0"
@@ -25,6 +27,10 @@ fs = ["dep:libc"]
 
 [dev-dependencies]
 get-size2 = { version = "0.11.1", default-features = false, features = ["alloc", "derive"] }
+
+# docs.rs builds with the default features only: this adds the file system backend.
+[package.metadata.docs.rs]
+features = ["fs"]
 
 [[example]]
 name = "std_fs"

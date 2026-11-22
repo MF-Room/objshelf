@@ -107,9 +107,10 @@
 //! does opening a sector whose header is not committed. So on a fresh chip, the first writes
 //! erase each sector once, and mount reads only page 0 of each sector.
 //!
-//! On the W25Q16JV at 25 MHz: page read ≈ 0.1 ms, page write 0.4 ms (3 ms max), sector erase
-//! 45 ms (400 ms max), mount of 2 MiB ≈ 0.7 s of SPI reads. The read-back adds about 25% to a
-//! typical page write.
+//! On the W25Q16JV at 25 MHz: page read 82 µs of SPI transfer, 0.23 ms with the blocking driver
+//! of `examples/rtic_nor`; page write 0.4 ms (3 ms max), sector erase 45 ms (400 ms max), mount
+//! of 2 MiB ≈ 1.9 s with that driver. The read-back adds a page read to each page write: 20% of a
+//! typical program at the transfer speed, 60% with that driver.
 //!
 //! # Space
 //!
