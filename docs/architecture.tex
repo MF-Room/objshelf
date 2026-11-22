@@ -1,0 +1,105 @@
+% Schematic of objshelf, shown in README.md: what the app calls, what ObjShelf keeps in RAM, and the
+% backends it reads and writes. architecture.svg is generated from this file: edit this one, then
+% regenerate it with
+%   pdflatex architecture.tex && pdftocairo -svg architecture.pdf architecture.svg
+%
+% The style is the one of mseq's docs/architecture.tex: the same fonts (Libertine, Inconsolata) at
+% 8 pt, square boxes, straight arrows with elbows, and Okabe-Ito tints with darkened outlines
+% (green for the user code, one colour per kind of object, purple for the backends, neutral black!4
+% for the rest). Frames and box outlines are thin while every connector is black and thicker, so
+% the two are never confused; calls are dashed, data moves on solid lines. All text is one size;
+% box titles are in bold, code identifiers are in \texttt and keep their case, every other text
+% block starts with a capital.
+\documentclass[tikz,border=0pt]{standalone}
+\usepackage[T1]{fontenc}
+\usepackage[tt=false, type1=true]{libertine}
+\usepackage[varqu]{zi4}
+\usepackage[libertine]{newtxmath}
+\usetikzlibrary{backgrounds}
+\renewcommand{\small}{\fontsize{8}{10}\selectfont}
+% White background with a margin, so the figure stays readable in GitHub's dark mode
+\tikzset{every picture/.append style={show background rectangle, inner frame sep=6pt,
+                                      background rectangle/.style={fill=white}}}
+
+\begin{document}
+\definecolor{cG}{HTML}{009E73}  % user code: Okabe-Ito bluish green
+\definecolor{cA}{HTML}{E69F00}  % changed objects: Okabe-Ito orange
+\definecolor{cB}{HTML}{56B4E9}  % unchanged objects: Okabe-Ito sky blue
+\definecolor{cC}{HTML}{9467BD}  % backends: purple
+% Coordinates in cm, y pointing up, origin at the bottom left of the user code frame. The three
+% rows (y = 3, 1.9 and 0.6) are shared by the three frames, so every connector is straight.
+\begin{tikzpicture}[
+    x=1cm, y=1cm, font=\small,
+    frame/.style = {draw=black!35, thin},
+    % Boxes are placed by the middle of their left edge, so lines along a row stay straight
+    obj/.style   = {draw=black!60, thin, fill=black!4, align=center, inner sep=1.5pt, anchor=west},
+    uobj/.style  = {obj, fill=cG!20, draw=cG!70!black, minimum width=4.1cm},
+    mobj/.style  = {obj, minimum width=4.3cm},
+    bobj/.style  = {obj, fill=cC!30, draw=cC!70!black, minimum width=4.1cm},
+    ttl/.style   = {font=\small\itshape, anchor=south west, inner sep=1pt},
+    tlab/.style  = {anchor=north west, inner sep=2pt},
+    lbl/.style   = {inner sep=1.5pt, align=center},
+    link/.style  = {line width=0.8pt},
+    ar/.style    = {link, -latex},
+    call/.style  = {ar, densely dashed},
+    dot/.style   = {circle, fill, inner sep=0pt, minimum size=4pt},
+  ]
+
+  %% ============================== user code
+  \node[ttl] at (0,4) {User code};
+  \draw[frame] (0,0) rectangle (4.4,4);
+
+  \node[uobj, minimum height=1.15cm] (tasks) at (0.15,3)
+    {\textbf{Tasks, any priority}\\\texttt{with}, \texttt{with\_mut}, \texttt{insert}, \texttt{remove}\\
+     \texttt{Ok(None)} \textit{when busy or full}};
+  \node[uobj, minimum height=0.8cm] (save) at (0.15,1.9)
+    {\textbf{Save task, lowest priority}\\\texttt{flush}, \texttt{flush\_object}};
+  \node[uobj, minimum height=0.8cm] (init) at (0.15,0.6)
+    {\textbf{\texttt{init}}\\\texttt{mount}, \texttt{get\_or\_insert\_with}};
+
+  %% ============================== ObjShelf
+  \node[ttl] at (6.2,4) {\textup{\texttt{ObjShelf}}, shared by the tasks, locked for short steps};
+  \draw[frame] (6.2,0) rectangle (10.95,4);
+
+  \draw[frame, fill=black!2] (6.35,1.35) rectangle (10.8,3.85);
+  \node[tlab] at (6.35,3.85) {\textbf{RAM cache}, \texttt{cache\_bytes}};
+  \node[mobj, minimum height=0.8cm, fill=cB!35, draw=cB!70!black] (clean) at (6.425,3)
+    {\textbf{Unchanged objects}\\Least recently used dropped first};
+  \node[mobj, minimum height=0.8cm, fill=cA!35, draw=cA!70!black] (dirty) at (6.425,1.9)
+    {\textbf{Changed objects}\\Kept until a flush};
+  \node[mobj, minimum height=0.8cm, minimum width=4.45cm] (names) at (6.35,0.6)
+    {\textbf{Names}\\Name, id and type of each object};
+
+  % The tasks work on plain Rust values in RAM
+  \draw[call] (tasks.east) -- (6.35,3) node[lbl, pos=0.5, above] {Plain values};
+  % The save task writes the changes; when they fill the budget, on_full asks for it
+  \draw[call] ([yshift=0.15cm]save.east) -- ([yshift=0.15cm]dirty.west);
+  \draw[call] ([yshift=-0.15cm]dirty.west) -- ([yshift=-0.15cm]save.east)
+    node[lbl, pos=0.5, below] {\texttt{on\_full}};
+  \draw[call] (init.east) -- (names.west) node[lbl, pos=0.5, above] {By name};
+
+  %% ============================== backends
+  \node[ttl] at (12.95,4) {Backends};
+  \draw[frame] (12.95,0) rectangle (17.2,4);
+
+  \node[bobj, minimum height=1.15cm] (nor) at (13.025,3)
+    {\textbf{NOR flash}\\Any blocking \texttt{NorFlash}\\Wear leveling, power-cut safe};
+  \node[bobj, minimum height=0.8cm] (fs) at (13.025,1.9)
+    {\textbf{File system}, feature \texttt{fs}\\One file per object};
+  \node[obj, minimum width=4.1cm, minimum height=0.8cm, densely dashed, draw=black!45,
+        fill=black!2, text=black!60] (fram) at (13.025,0.6)
+    {\textbf{FRAM}\\\textit{TODO}};
+
+  % Every backend serves the whole cache: one bus between them
+  \node[dot] (b3) at (12.45,3) {};
+  \node[dot] (b2) at (12.45,1.9) {};
+  \node[dot] (b1) at (12.45,0.6) {};
+  \draw[link] (b3) -- (b1);
+  \draw[link] (nor.west) -- (b3);
+  \draw[link] (fs.west) -- (b2);
+  \draw[link, densely dashed] (fram.west) -- (b1);
+  \draw[ar] (b3) -- (clean.east) node[lbl, pos=0.5, above] {Read};
+  \draw[ar] (dirty.east) -- (b2) node[lbl, pos=0.5, above] {Written};
+  \draw[ar] (b1) -- (names.east) node[lbl, pos=0.5, above] {Mount};
+\end{tikzpicture}
+\end{document}

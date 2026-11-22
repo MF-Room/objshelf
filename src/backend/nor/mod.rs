@@ -128,6 +128,11 @@
 //! the old one is released. An object, serialized with its name and type tag, takes at most 65535
 //! pages (about 15 MiB) and must fit in the free space: `write` returns [`NorError::NoSpace`]
 //! otherwise.
+//!
+//! Versions are a `u32` counter, and mount keeps the highest one: the flash wears out before it
+//! can wrap. Each write programs at least one page, and a W25Q16JV takes about 768 million page
+//! writes in its life (512 sectors × 15 data pages × 100 000 erases), against 4.3 billion
+//! versions. Only a region of about 11 MiB or more could get there.
 
 mod gc;
 mod layout;
