@@ -62,11 +62,23 @@ pub struct W25q16jv<S> {
 }
 
 impl<S: SpiDevice> W25q16jv<S> {
-    /// Wakes the chip up, in case it was powered down, and checks its JEDEC ID.
+    /// Wakes the chip up, in case it was powered down, waits until it is idle, and checks its
+    /// JEDEC ID.
     pub fn new(mut spi: S, delay: &mut impl DelayNs) -> Result<Self, Error<S::Error>> {
         spi.write(&[RELEASE_POWER_DOWN]).map_err(Error::Spi)?;
         // tRES1.
         delay.delay_us(3);
+        // The chip is not reset with the MCU: after an MCU reset during an erase, it finishes it,
+        // up to 400 ms for a sector. Until then, reads return zeros, which a mount would take for
+        // unformatted sectors, while the JEDEC ID still reads right. A busy chip was not powered
+        // down either, which needs it idle, so the wake-up above did not matter. A missing chip
+        // may read busy forever, so after 500 ms the ID check below fails instead.
+        for _ in 0..500 {
+            if read_status(&mut spi)? & STATUS_1_BUSY == 0 {
+                break;
+            }
+            delay.delay_ms(1);
+        }
         let mut id = [0; 3];
         spi.transaction(&mut [Operation::Write(&[JEDEC_ID]), Operation::Read(&mut id)])
             .map_err(Error::Spi)?;
@@ -87,19 +99,20 @@ impl<S: SpiDevice> W25q16jv<S> {
                 Operation::Write(data),
             ])
             .map_err(Error::Spi)?;
-        loop {
-            let mut status = [0];
-            self.spi
-                .transaction(&mut [
-                    Operation::Write(&[READ_STATUS_1]),
-                    Operation::Read(&mut status),
-                ])
-                .map_err(Error::Spi)?;
-            if status[0] & STATUS_1_BUSY == 0 {
-                return Ok(());
-            }
-        }
+        while read_status(&mut self.spi)? & STATUS_1_BUSY != 0 {}
+        Ok(())
     }
+}
+
+/// Reads status register 1.
+fn read_status<S: SpiDevice>(spi: &mut S) -> Result<u8, Error<S::Error>> {
+    let mut status = [0];
+    spi.transaction(&mut [
+        Operation::Write(&[READ_STATUS_1]),
+        Operation::Read(&mut status),
+    ])
+    .map_err(Error::Spi)?;
+    Ok(status[0])
 }
 
 fn with_addr(command: u8, addr: u32) -> [u8; 4] {
