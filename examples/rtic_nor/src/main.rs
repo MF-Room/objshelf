@@ -1,10 +1,12 @@
 //! objshelf on the MSeq board: RTIC 2 on its STM32F413, and the NOR backend on its W25Q16JV. The
 //! same app runs on std, with the file system backend: `examples/std_fs.rs`.
 //!
-//! The app keeps three objects across reboots: a boot count, settings written each time they
-//! change, and samples written every few rounds. After 20 rounds, it prints a report and stops.
-//! The report ends with the time each objshelf function took: its calls, their mean and the
-//! longest, from the cycle counter.
+//! The app keeps four objects across reboots: a boot count, settings written each time they
+//! change, and samples and a pattern written every few rounds. The pattern, of about 1 KiB, spans
+//! several pages of the flash. At boot, the app prints the objects it found from the last run, or
+//! created on the first one. After 20 rounds, it prints a report and stops. The report ends with
+//! the time each objshelf function took: its calls, their mean and the longest, from the cycle
+//! counter.
 //!
 //! ```text
 //! cd examples/rtic_nor
@@ -23,6 +25,7 @@ mod w25q16jv;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::time::Duration;
@@ -70,6 +73,62 @@ struct Samples(Vec<u16>);
 /// A made-up sensor: a temperature in hundredths of a degree.
 fn read_sensor(round: u32) -> u16 {
     2000 + (round * 37 % 100) as u16
+}
+
+/// Steps of the pattern: 8 tracks of 64.
+const STEPS: usize = 512;
+
+/// A sequencer pattern, of about 1 KiB serialized: more than a page of the NOR backend, which holds
+/// 234 bytes of an object per page. It takes 5 of them, written and read back as one object.
+#[derive(Serialize, Deserialize, GetSize)]
+struct Pattern {
+    steps: Vec<Step>,
+    /// Steps edited since the pattern was created, one per round.
+    edits: u32,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, GetSize)]
+struct Step {
+    note: u8,
+    velocity: u8,
+}
+
+impl Default for Pattern {
+    fn default() -> Self {
+        let step = Step {
+            note: 60,
+            velocity: 100,
+        };
+        Self {
+            steps: vec![step; STEPS],
+            edits: 0,
+        }
+    }
+}
+
+impl Pattern {
+    /// A made-up edit: the next step, in turn, gets another note.
+    fn edit(&mut self) {
+        let step = self.edits as usize % STEPS;
+        self.steps[step].note = 36 + (self.edits % 48) as u8;
+        self.edits += 1;
+    }
+
+    /// Its steps, its edits and the sum of its notes. The sum covers every step, so every page of
+    /// the object counts in it.
+    fn summary(&self) -> (usize, u32, u32) {
+        let notes = self.steps.iter().map(|step| u32::from(step.note)).sum();
+        (self.steps.len(), self.edits, notes)
+    }
+}
+
+/// The handles of the objects the tasks use: `Copy`, as each handle is, so it can be a spawn
+/// argument.
+#[derive(Clone, Copy)]
+struct Objects {
+    settings: objshelf::Handle<Settings>,
+    samples: objshelf::Handle<Samples>,
+    pattern: objshelf::Handle<Pattern>,
 }
 
 /// The calls to one objshelf function, in cycles of the core clock.
@@ -123,8 +182,8 @@ fn duration(cycles: u64) -> Duration {
 }
 
 /// Runs `call`, a call to the objshelf function `name`, and adds its time to `times`. In the tasks
-/// of priority 1, that includes the time `app` preempts them. The cycle counter wraps after 42 s,
-/// far more than a call takes.
+/// below `app`, that includes the time a task above preempts them. The cycle counter wraps after
+/// 42 s, far more than a call takes.
 fn timed<R>(times: &mut impl Mutex<T = Times>, name: &'static str, call: impl FnOnce() -> R) -> R {
     let start = DWT::cycle_count();
     let result = call();
@@ -151,7 +210,8 @@ fn init_heap() {
     unsafe { HEAP.init(&raw mut HEAP_MEM as usize, HEAP_SIZE) }
 }
 
-#[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [ADC, DMA1_STREAM0])]
+// One dispatcher per priority of the tasks: `report`, the saves and `app`.
+#[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [ADC, DMA1_STREAM0, DMA2_STREAM5])]
 mod app {
     use core::ops::Range;
 
@@ -186,9 +246,7 @@ mod app {
 
     #[local]
     struct Local {
-        // A handle is a `Copy` id of the object.
-        settings: Handle<Settings>,
-        samples: Handle<Samples>,
+        objects: Objects,
     }
 
     #[init]
@@ -240,7 +298,15 @@ mod app {
         .unwrap();
 
         // Before `mem` is shared, the functions take it directly. Each object is found after a
-        // reboot, or created on the first boot.
+        // reboot, or created on the first boot: the names stored by the earlier runs tell which.
+        let stored = timed(&mut times, "list", || objshelf::list(&mut mem));
+        let origin = |name: &str| {
+            if stored.iter().any(|stored| stored == name) {
+                "found"
+            } else {
+                "created"
+            }
+        };
         let boots = timed(&mut times, "get_or_insert_with", || {
             objshelf::get_or_insert_with(&mut mem, "boots", || 0u32)
         })
@@ -269,16 +335,62 @@ mod app {
         })
         .unwrap()
         .expect("fits");
+        let pattern = timed(&mut times, "get_or_insert_with", || {
+            objshelf::get_or_insert_with(&mut mem, "pattern", Pattern::default)
+        })
+        .unwrap()
+        .expect("fits");
 
+        // What the earlier runs left, before this one changes it.
+        let (name, brightness) = timed(&mut times, "with", || {
+            objshelf::with(&mut mem, &settings, |s| (s.name.clone(), s.brightness))
+        })
+        .unwrap()
+        .expect("nothing else has the memory");
+        rprintln!(
+            "{} settings: {:?}, brightness {}",
+            origin("settings"),
+            name,
+            brightness
+        );
+        let (count, last) = timed(&mut times, "with", || {
+            objshelf::with(&mut mem, &samples, |s| (s.0.len(), s.0.last().copied()))
+        })
+        .unwrap()
+        .expect("nothing else has the memory");
+        rprintln!("{} samples: {}, last {:?}", origin("samples"), count, last);
+        let (steps, edits, notes) = timed(&mut times, "with", || {
+            objshelf::with(&mut mem, &pattern, Pattern::summary)
+        })
+        .unwrap()
+        .expect("nothing else has the memory");
+        rprintln!(
+            "{} pattern: {} steps, {} edits, sum of notes {}",
+            origin("pattern"),
+            steps,
+            edits,
+            notes
+        );
+
+        let objects = Objects {
+            settings,
+            samples,
+            pattern,
+        };
         app::spawn().unwrap();
-        (Shared { mem, times }, Local { settings, samples })
+        (Shared { mem, times }, Local { objects })
     }
 
     // Above the tasks that write: it keeps running during a flush, so it can find the storage
     // busy, and then gets `Ok(None)`.
-    #[task(priority = 2, shared = [mem, times], local = [settings, samples])]
+    #[task(priority = 3, shared = [mem, times], local = [objects])]
     async fn app(mut cx: app::Context) {
-        let (settings, samples) = (*cx.local.settings, *cx.local.samples);
+        let objects = *cx.local.objects;
+        let Objects {
+            settings,
+            samples,
+            pattern,
+        } = objects;
         let mem = &mut cx.shared.mem;
         let times = &mut cx.shared.times;
         for round in 1..=ROUNDS {
@@ -318,19 +430,26 @@ mod app {
             if added.is_none() {
                 rprintln!("round {}: busy, sample {} dropped", round, reading);
             }
-            // The samples are written with the other changes, every few rounds.
+            let edited = timed(times, "with_mut", || {
+                objshelf::with_mut(mem, &pattern, Pattern::edit)
+            })
+            .unwrap();
+            if edited.is_none() {
+                rprintln!("round {}: busy, pattern edit dropped", round);
+            }
+            // The samples and the pattern are written with the other changes, every few rounds.
             if round % SAVE_EVERY == 0 {
                 save::spawn().ok();
             }
         }
-        report::spawn(settings, samples).ok();
+        report::spawn(objects).ok();
     }
 
-    // The tasks that write to the backend, at the lowest priority: every task above them keeps
-    // running meanwhile. With the same priority, none interrupts another, so none gets `None`.
+    // The tasks that write to the backend, below `app`, which keeps running meanwhile. The two
+    // saves have the same priority: neither interrupts the other, so neither gets `None`.
 
     // Writes all the changes. Spawned by `on_full`: only a full flush frees the whole budget.
-    #[task(priority = 1, shared = [mem, times])]
+    #[task(priority = 2, shared = [mem, times])]
     async fn save(mut cx: save::Context) {
         let mem = &mut cx.shared.mem;
         timed(&mut cx.shared.times, "flush", || objshelf::flush(mem)).unwrap();
@@ -339,7 +458,7 @@ mod app {
 
     // Writes only the settings: the other changes stay in RAM until `save` runs. A handle is
     // `Copy`, so it can be a spawn argument.
-    #[task(priority = 1, shared = [mem, times])]
+    #[task(priority = 2, shared = [mem, times])]
     async fn save_settings(mut cx: save_settings::Context, settings: Handle<Settings>) {
         let mem = &mut cx.shared.mem;
         timed(&mut cx.shared.times, "flush_object", || {
@@ -348,9 +467,17 @@ mod app {
         .unwrap();
     }
 
-    // The state of the memory once the rounds are done, then a stop.
+    // The state of the memory once the rounds are done, then a stop. Below the saves, so it runs
+    // after the last ones `app` spawns. Its flush writes at another priority than theirs, so a save
+    // during it would get `None`, but nothing spawns one then: `app` is done, and `on_full` only
+    // runs on changes, which `report` doesn't make.
     #[task(priority = 1, shared = [mem, times])]
-    async fn report(mut cx: report::Context, settings: Handle<Settings>, samples: Handle<Samples>) {
+    async fn report(mut cx: report::Context, objects: Objects) {
+        let Objects {
+            settings,
+            samples,
+            pattern,
+        } = objects;
         let mem = &mut cx.shared.mem;
         let times = &mut cx.shared.times;
         timed(times, "flush", || objshelf::flush(mem)).unwrap();
@@ -368,6 +495,17 @@ mod app {
         });
         if let Some((count, last)) = samples.unwrap() {
             rprintln!("samples: {}, last {:?}", count, last);
+        }
+        let pattern = timed(times, "with", || {
+            objshelf::with(mem, &pattern, Pattern::summary)
+        });
+        if let Some((steps, edits, notes)) = pattern.unwrap() {
+            rprintln!(
+                "pattern: {} steps, {} edits, sum of notes {}",
+                steps,
+                edits,
+                notes
+            );
         }
         rprintln!(
             "usage: {:?}",
